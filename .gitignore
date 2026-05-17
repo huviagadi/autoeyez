@@ -1,0 +1,33 @@
+# LUMEN notes (local only)
+PLAN.md
+
+# macOS
+.DS_Store
+*.app/
+
+# Test videos (large files)
+*.mp4
+
+# AppleScript source (keep only README for apps)
+*.scpt
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# Deprecated code
+deprecated/
+
+# Build artifacts
+*.o
+*.d
+*.elf
+*.hex
+*.eep
+*.lst
+*.sym
+build/

@@ -1,0 +1,18 @@
+[Unit]
+Description=AUTO_WAAAVE_4_5
+After=stream_receive.service
+Requires=stream_receive.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/openFrameworks/apps/myApps/AUTO_WAAAVE_4_5
+ExecStartPre=/bin/rm -f /tmp/autowaaave_launched
+ExecStartPre=/usr/bin/python3 /home/pi/splash.py
+ExecStart=/home/pi/openFrameworks/apps/myApps/AUTO_WAAAVE_4_5/bin/AUTO_WAAAVE_4_5
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

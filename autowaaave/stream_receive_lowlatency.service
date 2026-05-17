@@ -1,0 +1,13 @@
+[Unit]
+Description=Video Stream Receiver (Low Latency)
+After=network.target
+
+[Service]
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/ffmpeg -fflags nobuffer+flush_packets -flags low_delay -probesize 32 -analyzeduration 0 -f mjpeg -listen 1 -i tcp://0.0.0.0:1236 -vf scale=720:480 -pix_fmt rgb24 -f v4l2 /dev/video10
+Restart=always
+RestartSec=2
+User=pi
+
+[Install]
+WantedBy=multi-user.target
