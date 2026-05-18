@@ -1,23 +1,71 @@
 /*
- * automidi — Teensy 4.1 MIDI Controller Firmware
+ * =============================================================================
+ * automidi — Teensy 4.1 MIDI Controller Firmware v0.9.11
  * Part of the autoeyez video synthesis system
+ * =============================================================================
  *
- * Hardware:
- *   - Teensy 4.1 @ 600MHz with Audio Shield Rev D
- *   - 9x rotary encoders with pushbuttons (pins 30-47)
- *   - 9x SH1106 128x64 OLED displays (SPI, CS pins 0-6, 9, 14)
- *   - 2x 74HC165 shift registers for 12 button inputs
- *   - 1x 74HC595 shift register for 8 LED outputs
- *   - SD card for patch storage
+ * This firmware drives the physical control surface for the autoeyez video
+ * synthesizer. It reads encoders and buttons, displays parameter values on
+ * OLEDs, sends MIDI CC messages to autowaaave for shader control, and sends
+ * serial commands to autoclip for video playback control.
  *
- * Communication:
- *   - USB MIDI: sends CC to autowaaave (shader control)
- *   - USB Serial: sends commands to autoclip via video_bridge
+ * HARDWARE:
+ *   - Teensy 4.1 @ 600MHz with Audio Shield Rev D (for line-in FFT analysis)
+ *   - 9× rotary encoders with pushbuttons (encoder pins 30-47, buttons via shift registers)
+ *   - 9× SH1106 128×64 OLED displays (SPI bus, CS pins 0-6, 9, 14)
+ *   - 2× 74HC165 shift registers for 12 button inputs (active low)
+ *   - 1× 74HC595 shift register for 8 LED outputs
+ *   - SD card (Teensy built-in) for patch storage
  *
- * Pages:
- *   - Page 0: Audio/FX parameters (luma, blend, hue, sat, spatial)
- *   - Page 1: Video/Clip parameters (effects, delay, clip control)
- *   - Page 2: Mixer/Luma Key (crossfader, luma source, patches)
+ * COMMUNICATION:
+ *   USB MIDI Channel 1:
+ *     - CC 16-127: Shader parameters to autowaaave openFrameworks app
+ *     - CC 91: Patch load latch (127=start, 0=end)
+ *     - CC 92-93: Audio patch save/load
+ *
+ *   USB Serial 115200:
+ *     - Commands TO autoclip (via video_bridge on autowaaave):
+ *       NEXT, PREV, PLAY, PAUSE, LOOP_ON, LOOP_OFF, PLAY:n
+ *       CH_A:n, CH_B:n, MIX:n, LUMA:n, LUMA_SRC:n, LUMA_HIGH:n, LUMA_HIGH_EN:n
+ *     - Messages FROM autoclip:
+ *       FILE:name, POS:idx:count, PAUSE:0/1, LOOP:0/1, LIST:name1,name2,...
+ *       PROGRESS:pos:dur, START (system ready signal)
+ *
+ * PAGES (three control modes):
+ *   Page 0 - AUDIO/FX:
+ *     Encoders 0-7: Luma, Blend, Hue, Saturation, X Offset, Y Offset, Scale, Angle
+ *     Encoder 8: Line-in volume with FFT spectrum display
+ *     Buttons 1-4: Toggle controls (invert luma/hue/sat, toroidal wrap)
+ *     Buttons 5-8: Function multipliers (0×, 2×, 5×, 10× modulation)
+ *     Ring buttons: Audio-reactive band select (Low/Mid/High)
+ *
+ *   Page 1 - VIDEO/CLIP:
+ *     Encoders 0-7: Value, Blur, Bloom, Sharpen, Hue Modulo/LFO/Offset, Delay Time
+ *     Encoder 8: Clip list navigation and playback control
+ *     Ring buttons: Loop toggle, Play/Pause, Skip to next clip
+ *
+ *   Page 2 - MIXER/LUMA KEY:
+ *     Encoder 0: Luma key low threshold
+ *     Encoder 1: Luma key high threshold
+ *     Encoder 2: Fade to black
+ *     Encoder 4: Luma key source select
+ *     Encoder 5: Video patch browser
+ *     Encoder 6: Audio patch browser
+ *     Encoder 8: A/B crossfader or channel source select
+ *     Ring buttons: Select Ch A / Mixer view / Ch B
+ *
+ * PATCH SYSTEM:
+ *   - 32 video patches stored on SD card (PATCH01.TXT through PATCH32.TXT)
+ *   - 32 audio patches stored in autowaaave (triggered via MIDI CC 92/93)
+ *   - Hold encoder button to save, tap to load
+ *   - Patches store all encoder values, toggle states, mixer settings
+ *
+ * DISPLAY UPDATE STRATEGY:
+ *   To avoid starving the audio FFT analysis, only one display is updated per
+ *   main loop iteration. The graphUpdated[], labelUpdated[], etc. flags track
+ *   which displays need refresh, and the draw queue processes them one at a time.
+ *
+ * =============================================================================
  */
 
 // ============================================================
@@ -34,84 +82,120 @@
 // ============================================================
 // PIN DEFINITIONS & CONSTANTS
 // ============================================================
+// Hardware pin assignments for all peripherals connected to Teensy 4.1.
+// See BUILDME.md for wiring diagrams and shift register connections.
 
-// SD Card
-#define SD_CS 10
-#define PATCH_HOLD_MS 1500
-#define PATCH_FLASH_MS 1000
+// SD Card (using Teensy built-in SD slot)
+#define SD_CS 10              // Chip select for SD card (Audio Shield shares SPI)
+#define PATCH_HOLD_MS 1500    // Hold time for patch save (vs tap for load)
+#define PATCH_FLASH_MS 1000   // Duration of "SAVED!" / "LOADED!" feedback
 
 // Display dimensions
 #define SCREEN_WIDTH 128
 #define SCREEN_HEIGHT 64
 
-// 74HC595 LED shift register pins
-#define LED_DATA 22
-#define LED_CLOCK 24
-#define LED_LATCH 25
+// 74HC595 LED shift register pins (active high output)
+// Single 595 controls 8 LEDs on the control surface
+#define LED_DATA 22           // Serial data input (SER/DS)
+#define LED_CLOCK 24          // Shift clock (SRCLK/SH_CP)
+#define LED_LATCH 25          // Storage latch (RCLK/ST_CP)
 
-#define LED_1 3
-#define LED_2 4
-#define LED_3 5
-#define LED_4 6
-#define LED_5 7
-#define LED_6 0
-#define LED_7 1
-#define LED_8 2
+// LED bit positions in the 595 output byte
+// Physical layout: LEDs 1-4 are function indicators, 5-8 are control toggles
+#define LED_1 3               // Function LED 1 (modulation active)
+#define LED_2 4               // Function LED 2
+#define LED_3 5               // Function LED 3
+#define LED_4 6               // Function LED 4
+#define LED_5 7               // Control LED 5
+#define LED_6 0               // Control LED 6 / Page 0 indicator
+#define LED_7 1               // Control LED 7 / Page 1 indicator
+#define LED_8 2               // Control LED 8 / Page 2 indicator
 
-// 74HC165 button shift register pins
-#define BUTTON_DATA 26
-#define BUTTON_CLOCK 16
-#define BUTTON_LOAD 17
+// 74HC165 button shift register pins (active low input)
+// Two 165s daisy-chained for 16 bits (only 12 buttons used)
+#define BUTTON_DATA 26        // Serial data output (QH)
+#define BUTTON_CLOCK 16       // Shift clock (CLK)
+#define BUTTON_LOAD 17        // Parallel load (SH/LD, active low)
 
-// Button indices (bits from shift registers)
-#define BTN_LOW  0
-#define BTN_MID  1
-#define BTN_HI   2
-#define BTN_1    3
-#define BTN_2    4
-#define BTN_3    5
-#define BTN_4    6
-#define BTN_5    7
-#define BTN_6    8
-#define BTN_7    9
-#define BTN_8    10
-#define BTN_MENU 11
+// Button indices in the 16-bit shift register data
+// Buttons are active-low, so pressed = 0, released = 1
+#define BTN_LOW  0            // Ring button: Low band / Page 0
+#define BTN_MID  1            // Ring button: Mid band / Page 1
+#define BTN_HI   2            // Ring button: High band / Page 2
+#define BTN_1    3            // Encoder 0 push button
+#define BTN_2    4            // Encoder 1 push button
+#define BTN_3    5            // Encoder 2 push button
+#define BTN_4    6            // Encoder 3 push button
+#define BTN_5    7            // Encoder 4 push button
+#define BTN_6    8            // Encoder 5 push button
+#define BTN_7    9            // Encoder 6 push button
+#define BTN_8    10           // Encoder 7 push button
+#define BTN_MENU 11           // Encoder 8 push button (page/menu)
 
 #define DEBOUNCE_MS 5
 #define GRAPH_Y 26
 #define GRAPH_H 12
-#define PAGE_HOLD_MS 300
+#define PAGE_HOLD_MS 300      // Hold time to enter page-select mode
 
+// ============================================================
+// VIDEO COMMAND QUEUE
+// ============================================================
+// Commands to autoclip are queued to avoid overwhelming the serial link.
+// The queue is flushed at a rate slower than autoclip's poll interval.
 #define VIDEO_CMD_QUEUE_SIZE 12
-char videoCmdQueue[VIDEO_CMD_QUEUE_SIZE][24] ;
-int  videoCmdHead = 0 ;
-int  videoCmdTail = 0 ;
+char videoCmdQueue[VIDEO_CMD_QUEUE_SIZE][24] ;  // Circular buffer of commands
+int  videoCmdHead = 0 ;                          // Read position
+int  videoCmdTail = 0 ;                          // Write position
 
-bool patchLoadPending = false ;
-int  patchLoadStep    = 0 ;
-unsigned long patchLoadTimer = 0 ;
+// Patch loading state machine
+// When loading a patch, MIDI values are sent one at a time to avoid
+// overwhelming the autowaaave app. patchLoadStep tracks progress.
+bool patchLoadPending = false ;   // True while patch load is in progress
+int  patchLoadStep    = 0 ;       // Current step in the load sequence
+unsigned long patchLoadTimer = 0 ;// Throttle timer for staggered sends
 
 // ============================================================
 // ENCODER SETUP
-// Pins 30-47: 9 encoders × 2 pins (CLK, DT)
 // ============================================================
-Encoder enc0(30, 31) ;
-Encoder enc1(32, 33) ;
-Encoder enc2(34, 35) ;
-Encoder enc3(36, 37) ;
-Encoder enc4(38, 39) ;
-Encoder enc5(40, 41) ;
-Encoder enc6(42, 43) ;
-Encoder enc7(44, 45) ;
-Encoder enc8(46, 47) ;
+// 9 quadrature encoders connected to consecutive pin pairs.
+// Each encoder uses 2 pins for A/B quadrature signals.
+// The Encoder library handles interrupt-based position tracking.
+
+Encoder enc0(30, 31) ;    // Top row, left
+Encoder enc1(32, 33) ;    // Top row, center-left
+Encoder enc2(34, 35) ;    // Top row, center
+Encoder enc3(36, 37) ;    // Top row, center-right
+Encoder enc4(38, 39) ;    // Bottom row, left
+Encoder enc5(40, 41) ;    // Bottom row, center-left
+Encoder enc6(42, 43) ;    // Bottom row, center
+Encoder enc7(44, 45) ;    // Bottom row, center-right
+Encoder enc8(46, 47) ;    // Master encoder (bottom right)
 
 Encoder* encoders[9] = { &enc0, &enc1, &enc2, &enc3, &enc4, &enc5, &enc6, &enc7, &enc8 } ;
+
+// Encoder sensitivity: pulses per value step (higher = slower)
 int encoder_speed = 2 ;
+
+// Last encoder position for delta calculation
+// 18 slots: encoders 0-8 on page 0 (indices 0-8), encoders 0-8 on page 1 (indices 9-17)
 long lastEncPos[18] = {0} ;
+
+// Parameter values for all 18 encoder functions (9 per page × 2 pages)
+// These are sent as MIDI CC values (0-127 range)
+// Index mapping: Page 0 = indices 0-8, Page 1 = indices 9-17
 int  function_value[18]     { 0, 64, 63, 63, 63, 63, 63, 63, 100,   63, 63, 0, 0, 0, 63, 63, 0, 63 } ;
+
+// Reset/default values for each parameter (used by global reset function)
 int  function_reset[18]     { 0, 64, 63, 63, 63, 63, 63, 63, 100,   63, 63, 0, 0, 0, 63, 63, 0, 63 } ;
+
+// Encoder direction: 1 = CW increases, -1 = CW decreases (for inverted UX)
 int  function_direction[18] { 1, 1, 1, 1, -1, -1, 1, -1, 1,        1, 1, 1, 1, 1, 1, 1, 1, 1 } ;
+
+// Graph display type: 0 = bar from left, 1 = center-out bipolar
 bool function_graphType[18] { 0, 1, 1, 1, 1, 1, 1, 1, 1,           1, 1, 0, 0, 0, 1, 1, 0, 1 } ;
+
+// MIDI CC numbers for each encoder parameter
+// These map to parameters in the autowaaave openFrameworks shader app
 int  cc_encoder[18]         { 16, 17, 18, 19, 120, 121, 122, 123, 7,   20, 21, 22, 23, 124, 125, 126, 127, 0 } ;
 
 unsigned long lastFrameTime = 0 ;
@@ -173,28 +257,41 @@ int  serialBufPos = 0 ;
 // ============================================================
 // MIXER STATE
 // ============================================================
+// The mixer on autoclip has two channels (A and B) that can be sourced
+// from clips, composite inputs, or oscilloscope. These settings control
+// the video mixer via serial commands sent through video_bridge.
+
 #define NUM_SOURCES 5
 const char* sourceNames[NUM_SOURCES] = {
   "CLIPS", "COMPOSITE 1", "COMPOSITE 2", "COMPOSITE 3", "OSCILLOSCOPE"
 } ;
 
+// Luma key source includes "NONE" as first option
 #define NUM_LUMA_SOURCES 6
 const char* lumaSourceNames[NUM_LUMA_SOURCES] = {
   "NONE", "CLIPS", "COMPOSITE 1", "COMPOSITE 2", "COMPOSITE 3", "OSCILLOSCOPE"
 } ;
 
-int  mixerSubMode      = 1 ;   // default to none
-int  chASource         = 0 ;
-int  chBSource         = 1 ;
-int  chASelection      = 0 ;
-int  chBSelection      = 0 ;
-int  chAScroll         = 0 ;
-int  chBScroll         = 0 ;
-int  mixValue          = 63 ;
-int  lumaKeyValue      = 0 ;
-int  lumaHighValue     = 127 ;
-bool lumaHighEnabled   = false ;
-bool lumaLowEnabled    = false ;
+// Mixer page sub-modes (selected by ring buttons on page 2)
+// 0 = Channel A source select, 1 = Mixer/crossfader view, 2 = Channel B source select
+int  mixerSubMode      = 1 ;   // Default to mixer view
+
+// Channel source assignments (which source feeds each channel)
+int  chASource         = 0 ;   // Channel A current source (sent to autoclip)
+int  chBSource         = 1 ;   // Channel B current source
+
+// Channel source selection (cursor position in source list, not yet confirmed)
+int  chASelection      = 0 ;   // Channel A selection cursor
+int  chBSelection      = 0 ;   // Channel B selection cursor
+int  chAScroll         = 0 ;   // Channel A list scroll offset
+int  chBScroll         = 0 ;   // Channel B list scroll offset
+
+// Crossfade and luma key parameters
+int  mixValue          = 63 ;   // A/B crossfade: 0=full A, 127=full B
+int  lumaKeyValue      = 0 ;    // Luma key low threshold (0-127)
+int  lumaHighValue     = 127 ;  // Luma key high threshold (0-127)
+bool lumaHighEnabled   = false ;// Enable high threshold cutoff
+bool lumaLowEnabled    = false ;// Enable low threshold (luma key active)
 static long enc5Accum         = 0 ;
 int      patchCursor          = 0 ;
 int      patchScroll          = 0 ;
@@ -309,11 +406,23 @@ unsigned long lastMidiWatchdog = 0 ;
 bool midiInitialized = false ;
 
 // ============================================================
-// SERIAL
+// SERIAL COMMUNICATION
 // ============================================================
+// USB Serial handles bidirectional communication:
+//   TX: Commands to autoclip (via video_bridge on autowaaave)
+//   RX: State updates from autoclip (clip names, positions, etc.)
 
+/**
+ * Send a command immediately to autoclip via serial.
+ * Use for real-time controls that need immediate response.
+ */
 void sendVideoCommand(const char* cmd) { Serial.println(cmd) ; }
 
+/**
+ * Queue a command for rate-limited sending to autoclip.
+ * Use for batch operations (e.g., patch load) to avoid overwhelming the link.
+ * Circular buffer drops commands if full (shouldn't happen in normal use).
+ */
 void queueVideoCommand(const char* cmd) {
   int next = (videoCmdTail + 1) % VIDEO_CMD_QUEUE_SIZE ;
   if (next != videoCmdHead) {
@@ -323,41 +432,65 @@ void queueVideoCommand(const char* cmd) {
   }
 }
 
+/**
+ * Send one queued command per call, rate-limited to 15ms intervals.
+ * Called from main loop. Pauses during patch loading to allow MIDI traffic.
+ */
 void flushVideoQueue() {
   static unsigned long lastFlush = 0 ;
-  if (patchLoadPending) return ;
-  if (videoCmdHead == videoCmdTail) return ;
-  if (millis() - lastFlush < 15) return ;  // 15ms > mixer 10ms poll
+  if (patchLoadPending) return ;              // Pause queue during patch load
+  if (videoCmdHead == videoCmdTail) return ;  // Queue empty
+  if (millis() - lastFlush < 15) return ;     // Rate limit (mixer polls at 10ms)
   lastFlush = millis() ;
   Serial.println(videoCmdQueue[videoCmdHead]) ;
   videoCmdHead = (videoCmdHead + 1) % VIDEO_CMD_QUEUE_SIZE ;
 }
 
+/**
+ * Parse and handle incoming serial messages from autoclip.
+ * Messages are forwarded by video_bridge.py on autowaaave.
+ *
+ * Message formats:
+ *   START           - System ready signal (ends boot wait)
+ *   FILE:name       - Current clip name for display
+ *   PAUSE:0/1       - Playback state (0=playing, 1=paused)
+ *   LOOP:0/1        - Loop mode state
+ *   POS:idx:count   - Clip position in playlist
+ *   LIST:a,b,c,...  - Full clip list (comma-separated names)
+ *   PROGRESS:p:d    - Playback position (seconds) and duration
+ */
 void handleSerialMessage(const char* msg) {
+  // System ready signal from video_bridge (autowaaave is running)
   if (strncmp(msg, "START", 5) == 0) {
     autowaaaveReady = true ;
     Serial.println("GOT_START") ;
     return ;
   }
+
+  // Current clip name for OLED display
   if (strncmp(msg, "FILE:", 5) == 0) {
     strncpy(nowPlaying, msg + 5, 19) ; nowPlaying[19] = '\0' ;
     videoDisplayUpdated = false ;
   }
+  // Playback state (inverse: PAUSE:0 means playing)
   else if (strncmp(msg, "PAUSE:", 6) == 0) {
     isPlaying = (atoi(msg + 6) == 0) ;
     videoDisplayUpdated = false ;
     if (page == 1) { LED_ON[LED_7] = isPlaying ; }
   }
+  // Loop mode state
   else if (strncmp(msg, "LOOP:", 5) == 0) {
     isLooping = (atoi(msg + 5) == 1) ;
     videoDisplayUpdated = false ;
     if (page == 1) { LED_ON[LED_6] = isLooping ; }
   }
+  // Position in clip list (index:total)
   else if (strncmp(msg, "POS:", 4) == 0) {
     char* colon = strchr(msg + 4, ':') ;
     if (colon) { clipPos = atoi(msg + 4) ; clipTotal = atoi(colon + 1) ; }
     videoDisplayUpdated = false ;
   }
+  // Full clip list (sent on startup and periodically)
   else if (strncmp(msg, "LIST:", 5) == 0) {
     clipCount = 0 ;
     char buf[256] ; strncpy(buf, msg + 5, 255) ; buf[255] = '\0' ;
@@ -368,6 +501,7 @@ void handleSerialMessage(const char* msg) {
     }
     videoDisplayUpdated = false ;
   }
+  // Playback progress (position:duration in seconds)
   else if (strncmp(msg, "PROGRESS:", 9) == 0) {
     char* colon = strchr(msg + 9, ':') ;
     if (colon) { progressPos = atoi(msg + 9) ; progressTotal = atoi(colon + 1) ; }
@@ -976,15 +1110,30 @@ void scanAudioPatches() {
   AudioInterrupts() ;
 }
 
+/**
+ * Save current state to a patch slot on SD card.
+ * Patch files are plain text with key=value pairs.
+ * Called when user holds encoder 5 button on page 2.
+ *
+ * @param slot Patch slot number (0-31)
+ */
 void savePatch(int slot) {
-  AudioNoInterrupts() ;
+  AudioNoInterrupts() ;  // Pause audio during SD access
   char fname[24] ;
   snprintf(fname, 24, "/PATCH%02d.TXT", slot + 1) ;
+
+  // Remove existing file to ensure clean write
   if (SD.exists(fname)) SD.remove(fname) ;
   File f = SD.open(fname, FILE_WRITE) ;
   if (!f) return ;
+
+  // Save encoder values (18 parameters across 2 pages)
   for (int i = 0 ; i < 18 ; i++) { f.print("enc") ; f.print(i) ; f.print("=") ; f.println(function_value[i]) ; }
+
+  // Save toggle states (8 on/off controls)
   for (int i = 0 ; i < 8 ; i++)  { f.print("ctrl") ; f.print(i) ; f.print("=") ; f.println(control[i] ? 1 : 0) ; }
+
+  // Save function multiplier states (8 encoders × 4 levels each)
   for (int i = 0 ; i < 8 ; i++)  { f.print("func") ; f.print(i) ; f.print("=") ; f.println(function[i]) ; }
   f.print("react=")     ; f.println(react_band) ;
   f.print("lumaKey=")   ; f.println(lumaKeyValue) ;
@@ -1008,13 +1157,24 @@ void savePatch(int slot) {
   AudioInterrupts() ;
 }
 
+/**
+ * Load a patch from SD card and apply to current state.
+ * Parses the key=value pairs and updates all parameters.
+ * Sends MIDI and serial commands to sync autowaaave and autoclip.
+ * Called when user taps encoder 5 button on page 2 (if slot is filled).
+ *
+ * @param slot Patch slot number (0-31)
+ */
 void loadPatch(int slot) {
   char fname[24] ;
   snprintf(fname, 24, "/PATCH%02d.TXT", slot + 1) ;
-  AudioNoInterrupts() ;
+  AudioNoInterrupts() ;  // Pause audio during SD access
+
   if (!SD.exists(fname)) { AudioInterrupts() ; return ; }
   File f = SD.open(fname) ;
   if (!f) { AudioInterrupts() ; return ; }
+
+  // Parse each line of the patch file
   while (f.available()) {
     char line[32] ;
     int len = 0 ;
@@ -1137,13 +1297,18 @@ void executePatchLoad() {
 // ============================================================
 // SETUP
 // ============================================================
+// Initializes all hardware: serial, audio, GPIOs, displays, SD card.
+// Shows boot animation on OLEDs while waiting for autowaaave to signal ready.
 
 void setup() {
+  // USB Serial for communication with video_bridge on autowaaave
   Serial.begin(115200) ;
-  AudioMemory(32) ;
-  audioShield.enable() ;
-  audioShield.inputSelect(AUDIO_INPUT_LINEIN) ;
-  audioShield.lineInLevel(3) ;
+
+  // Teensy Audio Library setup for FFT spectrum analysis
+  AudioMemory(32) ;           // Allocate audio buffer blocks
+  audioShield.enable() ;      // Power on SGTL5000 codec
+  audioShield.inputSelect(AUDIO_INPUT_LINEIN) ;  // Use line-in (not mic)
+  audioShield.lineInLevel(3) ;// Input sensitivity (0-15, lower=hotter)
 
   Serial.println("Audio Setup") ;
   pinMode(12, INPUT) ;

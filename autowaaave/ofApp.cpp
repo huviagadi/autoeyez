@@ -10,67 +10,154 @@
  */
 
 /*
+ * =============================================================================
  * autowaaave — GPU Video Feedback Processor
  * Part of the autoeyez video synthesis system
+ * =============================================================================
  *
  * Based on auto_waaave v1.5 by Andrei Jay (ex-zee-ex)
  * https://github.com/ex-zee-ex/auto_waaave
  *
- * Modified for integration with automidi controller and autoclip video mixer.
- * Receives MIDI CC from Teensy, video stream from autoclip, outputs to HDMI.
+ * This openFrameworks application runs on a Raspberry Pi 3B+ and performs
+ * real-time GPU-accelerated video processing with feedback effects.
+ *
+ * INTEGRATION WITH AUTOEYEZ:
+ *   Input:
+ *     - Video stream from autoclip (Pi 5) via TCP on port 1236
+ *     - MIDI CC messages from automidi (Teensy) via USB
+ *     - Audio from HiFiBerry line-in for FFT analysis
+ *
+ *   Output:
+ *     - HDMI to display/capture (processed video with effects)
+ *
+ *   Control flow:
+ *     automidi (Teensy)
+ *       → USB MIDI
+ *       → THIS APP (receives CC messages)
+ *       → GPU shader processing
+ *       → HDMI output
+ *
+ * KEY FEATURES:
+ *   - Video feedback with UV displacement (warp, zoom, rotate)
+ *   - HSB color manipulation (hue shift, saturation, brightness)
+ *   - Luma keying for compositing
+ *   - Temporal filtering (frame blending, resonance)
+ *   - Sharpening post-process
+ *   - Audio-reactive modulation (FFT low/mid/high bands)
+ *   - P-lock recording (parameter automation at 30fps × 8 seconds)
+ *   - 32 audio patches (stored on Pi)
+ *
+ * MIDI CC MAP (from automidi):
+ *   CC 2:    Fade to black
+ *   CC 7:    Audio input gain
+ *   CC 16:   Luma key threshold
+ *   CC 17:   Feedback mix
+ *   CC 18:   Hue shift
+ *   CC 19:   Saturation
+ *   CC 20:   Brightness (page 1) / Value (page 0)
+ *   CC 21:   Blur
+ *   CC 22:   Bloom
+ *   CC 23:   Sharpen
+ *   CC 91:   Patch load latch (127=start, 0=end)
+ *   CC 92:   Save audio patch (value = slot)
+ *   CC 93:   Load audio patch (value = slot)
+ *   CC 120-127: Spatial parameters (X/Y offset, zoom, rotate, hue mod/lfo/off)
+ *   + many more for toggles and multipliers (see midibiz function)
+ *
+ * P-LOCK SYSTEM:
+ *   Records parameter changes into a 240-step circular buffer running at 30fps.
+ *   This creates an 8-second automation loop that can be recorded live.
+ *   Each parameter (17 total) has its own lane in the p_lock array.
+ *
+ * FRAMEBUFFER SYSTEM:
+ *   Uses a circular buffer of 60 framebuffers for video delay/feedback.
+ *   At 30fps this provides 2 seconds of delay time.
+ *   The delay tap position is controlled by MIDI CC 127.
+ *
+ * =============================================================================
  */
 
 #include "ofApp.h"
 
 #include "iostream"
 
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+// MIDI center value for bipolar parameters (0-127 range, center at 63.5)
 #define MIDI_MAGIC 63.50f
 
+// Threshold for MIDI control "pick-up" (prevents jumps when knob doesn't match)
 #define CONTROL_THRESHOLD .035f
 
-//flip this switch to try different scalings
-//0 is 320 1 is 640
-//if you reduce scale to 320 you can up the total delay time to
-//about 4 seconds/ 120 frames
-//so try that out sometime and see how that feels!
-bool forceMidiWrite = false ;
+// =============================================================================
+// CONFIGURATION FLAGS
+// =============================================================================
+
+// Resolution switch: 0 = 320×240 (lower res, more delay frames)
+//                    1 = 640×480 (higher res, standard delay)
 bool scaleswitch=1;
+
+// Frame buffer length for delay/feedback (60 frames @ 30fps = 2 seconds)
 const int framebufferLength=60;
+
+// =============================================================================
+// MIDI PATCH LOADING STATE
+// =============================================================================
+
+// When loading a patch, forceMidiWrite bypasses the pick-up threshold
+// so all parameter values are immediately applied
+bool forceMidiWrite = false ;
 unsigned long forceMidiWriteTimer = 0 ;
 unsigned long midiReconnectTimer = 0 ;
+
+// =============================================================================
+// FADE TO BLACK
+// =============================================================================
+
+// Blackout overlay controlled by CC 2 (for smooth fade transitions)
 float blackoutAmount = 0 ;
 float blackoutSmoothed = 0 ;
-//const int framebufferLength=120;
 
-//0 is picaputre, 1 is usbinput
+// =============================================================================
+// INPUT AND OUTPUT MODES
+// =============================================================================
+
+// Input source: 0 = Pi camera, 1 = USB/network video input
+// For autoeyez, always 1 (video comes from autoclip via TCP)
 bool inputswitch=1;
 
-//0 is wet (framebuffer fed from final output, internal
-//feedback mode
-//1 is dry (framebuffer fed direct from camera input,
-//traditional video delay mode
+// Feedback mode:
+//   0 = Wet (internal feedback): output feeds back into itself
+//   1 = Dry (delay mode): input feeds delay buffer, no self-feedback
 bool wet_dry_switch=1;
 
-//0 is sd aspect ratio
-//use definitely with all of the VSERPI devices 
-//and anything else doing like 480i/p over hdmi
-//1 is corner cropping to fill the screen
+// Aspect ratio handling:
+//   0 = SD 4:3 aspect (for composite/480i sources)
+//   1 = HD 16:9 corner crop (for HD sources)
 int hdmi_aspect_ratio_switch=0;
 
-float az = 1.0;
-float sx = 0;
-float dc = 0;
-float fv = 1;
-float gb = 1;
-float hn = 1;
-float jm = 0.0;
-float kk = 0.0;
-float ll = 0.0;
-float qw = 0.0;
-float er = 1.0;
-float ty = 0.0;
-float ui = 0.0;
-float op = 0.0;
+// =============================================================================
+// SHADER PARAMETERS (base values from keyboard/direct control)
+// =============================================================================
+// These single-letter variables are legacy from auto_waaave keyboard mapping.
+// They're combined with p-lock and audio-reactive values in parametersAssign().
+
+float az = 1.0;   // Z displacement (zoom)
+float sx = 0;     // X displacement
+float dc = 0;     // Y displacement (d/c keys)
+float fv = 1;     // Hue attenuation
+float gb = 1;     // Saturation attenuation
+float hn = 1;     // Brightness attenuation
+float jm = 0.0;   // Feedback mix amount
+float kk = 0.0;   // Luma key threshold
+float ll = 0.0;   // Sharpen amount
+float qw = 0.0;   // Rotation
+float er = 1.0;   // Hue modulo
+float ty = 0.0;   // Hue offset
+float ui = 0.0;   // Hue LFO
+float op = 0.0;   // Temporal filter mix
 
 float fb1_brightx=0.0;
 bool toroidSwitch=0;
@@ -91,10 +178,17 @@ int width=640;
 int height=480;
 
 
-//dummy variables for midi to audio attenuatiors
-//0 is direct midi, 1 is low_x, 2 is mid_x, 3 is high_x
+// =============================================================================
+// AUDIO-REACTIVE MODULATION
+// =============================================================================
+// Each parameter can be modulated by FFT frequency bands (low/mid/high).
+// The automidi controller selects which band to assign via ring buttons.
+// lowCn, midCn, highCn are the modulation amounts for parameter n.
+
+// Audio reactive mode: 0=direct MIDI, 1=low band, 2=mid band, 3=high band
 int audioReactiveControlSwitch=0;
 
+// Low-frequency (bass) modulation amounts for each parameter
 float lowC1=0.0;
 float lowC2=0.0;
 float lowC3=0.0;
@@ -209,34 +303,40 @@ void incIndex()  // call this every frame to calc the offset eeettt
     framedelayoffset=framecount % framebufferLength;
 }
 
-//p_lock biz
-//maximum total size of the plock array
+// =============================================================================
+// P-LOCK (Parameter Lock) SYSTEM
+// =============================================================================
+// P-locks record parameter changes into a circular buffer for automation.
+// At 30fps with 240 steps, this creates an 8-second loop.
+// Each encoder parameter has its own lane in the p_lock array.
+// The automidi controller uses this for live recording of parameter automation.
+
+// Size of p-lock buffer (240 steps @ 30fps = 8 seconds)
 const int p_lock_size=240;
 
+// Master p-lock enable switch (CC 55)
 bool p_lock_switch=0;
 
+// Erase mode (clears p-lock buffer when enabled)
 bool p_lock_erase=0;
 
-//maximum number of p_locks available...maybe there can be one for every knob
-//for whatever wacky reason the last member of this array of arrays has a glitch
-//so i guess just make an extra array and forget about it for now
+// Number of p-lock lanes (one per recordable parameter)
+// Note: extra lane allocated due to array bounds quirk in original code
 const int p_lock_number=17;
 
-//so how we will organize the p_locks is in multidimensional arrays
-//to access the data at timestep x for p_lock 2 (remember counting from 0) we use p_lock[2][x]
+// 2D array storing recorded values: p_lock[parameter][timestep]
 float p_lock[p_lock_number][p_lock_size];
 
-//smoothing parameters(i think for all of these we can array both the arrays and the floats
-//for now let us just try 1 smoothing parameter for everything.
+// Smoothing factor for p-lock playback (0-1, higher = smoother)
 float p_lock_smooth=.25;
 
-//and then lets try an array of floats for storing the smoothed values
+// Smoothed p-lock values (output after interpolation)
 float p_lock_smoothed[p_lock_number];
 
-//turn on and off writing to the array
+// Enable p-lock recording (usually always on)
 bool p_lock_0_switch=1;
 
-//global counter for all the locks
+// Current position in p-lock buffer (0 to p_lock_size-1)
 int p_lock_increment=0;
 
 float my_normalize=0;
@@ -309,24 +409,29 @@ float d_rotate;
 float d_huex_mod;
 float d_huex_off;
 float d_huex_lfo;
-//--------------------------------------------------------------
+// =============================================================================
+// SETUP — Application initialization
+// =============================================================================
 void ofApp::setup() {
-    //ofSetVerticalSync(true);
+    // Target 30fps (matches automidi's p-lock timing)
     ofSetFrameRate(30);
     ofBackground(0);
-    //ofToggleFullscreen();
-    ofHideCursor();
-    //omx_settings();
-    inputSetup();
-    midiSetup();
-    fbDeclareAndAllocate();
-    shader_mixer.load("shadersES2/shader_mixer");
-    shaderSharpen.load("shadersES2/shaderSharpen");
-    //fft biz
+    ofHideCursor();  // No cursor for video output display
+
+    // Initialize subsystems
+    inputSetup();           // Video input (TCP stream from autoclip)
+    midiSetup();            // USB MIDI from automidi Teensy
+    fbDeclareAndAllocate(); // Framebuffer objects for delay/feedback
+
+    // Load GPU shaders
+    shader_mixer.load("shadersES2/shader_mixer");    // Main video processing
+    shaderSharpen.load("shadersES2/shaderSharpen");  // Sharpen post-process
+
+    // FFT audio analysis (HiFiBerry line-in)
     fft.setup();
     fft.setNormalize(false);
-    //fft.setVolumeRange(1.0f);
-    
+
+    // Clear p-lock buffers and MIDI state
     p_lockClear();
     midiLatchClear();
 }
@@ -1060,11 +1165,20 @@ void ofApp::keyPressed(int key) {
         }//endifor
     }
 }
-//------------------------------------------------------------------
+// =============================================================================
+// MIDI MESSAGE PROCESSING
+// =============================================================================
+// Processes incoming MIDI CC messages from automidi.
+// Handles:
+//   - Toggle switches (on/off states)
+//   - Continuous controls with pick-up behavior
+//   - P-lock recording
+//   - Audio-reactive assignment
+//   - Patch load/save commands
 void ofApp::midibiz(){
-    
+
     for(unsigned int i = 0; i < midiMessages.size(); ++i) {
-        
+
         ofxMidiMessage &message = midiMessages[i];
         
         if(message.status < MIDI_SYSEX) {
