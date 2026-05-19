@@ -33,16 +33,14 @@ flowchart TB
 
     automidi -->|USB MIDI| SHADER
     automidi -->|USB Serial| BRIDGE
-    BRIDGE -->|Serial to UDP| automidi
+    BRIDGE -->|UDP to Serial| automidi
 
-    BRIDGE -->|UDP Commands| autoclip
-    autoclip -->|UDP State| BRIDGE
-    autoclip -->|TCP Video Stream| SHADER
+    BRIDGE ---|UDP Cmds/State| autoclip
 
     SOURCES --> CAPTURE
     PLAYER --> MIXER
     CAPTURE --> MIXER
-    MIXER -->|720x480 H.264| SHADER
+    MIXER -->|TCP Video| SHADER
     SHADER --> HDMI
 
     AUDIO --> SHADER
