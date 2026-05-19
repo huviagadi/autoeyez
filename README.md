@@ -70,13 +70,60 @@ Video clip player and hardware mixer. Plays MP4 clips from SD card, captures 3 c
 
 ## Signal Flow
 
-1. **Video Sources** → autoclip captures composite video + plays stored clips
-2. **Compositing** → autoclip mixes sources with crossfade and luma key
-3. **Streaming** → autoclip sends 720×480 H.264 stream to autowaaave via TCP (port 1236)
-4. **Processing** → autowaaave applies GPU shader feedback effects
-5. **Output** → autowaaave outputs processed video to HDMI
-6. **Control** → automidi sends USB MIDI to autowaaave for shader parameters
-7. **Bridging** → automidi sends serial commands through autowaaave to autoclip via UDP
+```mermaid
+flowchart LR
+    subgraph sources["Video Sources"]
+        COMP1[Composite 1]
+        COMP2[Composite 2]
+        COMP3[Composite 3]
+        CLIPS[(MP4 Clips)]
+    end
+
+    subgraph autoclip["autoclip (Pi 5)"]
+        CAP[USB Capture]
+        PLAY[Clip Player]
+        MIX[Video Mixer]
+        ENC[H.264 Encode]
+    end
+
+    subgraph autowaaave["autowaaave (Pi 3B+)"]
+        DEC[Decode Stream]
+        FB[Feedback Buffer]
+        SHADER[GPU Shaders]
+        SHARP[Sharpen]
+    end
+
+    subgraph output["Output"]
+        HDMI[HDMI Display]
+    end
+
+    COMP1 --> CAP
+    COMP2 --> CAP
+    COMP3 --> CAP
+    CLIPS --> PLAY
+
+    CAP --> MIX
+    PLAY --> MIX
+    MIX -->|Crossfade + Luma Key| ENC
+    ENC -->|TCP :1236| DEC
+
+    DEC --> FB
+    FB -->|60 frames| SHADER
+    SHADER -->|UV Warp, HSB, Feedback| SHARP
+    SHARP --> HDMI
+    SHADER -.->|Feedback Loop| FB
+```
+
+| Stage | Device | Process |
+|-------|--------|---------|
+| 1. Capture | autoclip | USB capture cards decode composite video (640×480 MJPEG) |
+| 2. Playback | autoclip | MP4 clips decoded via ffmpeg (720×576) |
+| 3. Mixing | autoclip | A/B crossfade + luma key compositing |
+| 4. Streaming | autoclip | H.264 encode → TCP to autowaaave (720×480) |
+| 5. Feedback | autowaaave | 60-frame circular buffer (2 sec delay) |
+| 6. Shaders | autowaaave | UV displacement, HSB manipulation, temporal filter |
+| 7. Sharpen | autowaaave | Optional sharpening post-process |
+| 8. Output | autowaaave | Final frame to HDMI display |
 
 ## Features
 
