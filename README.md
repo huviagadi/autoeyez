@@ -8,45 +8,43 @@ autoeyez combines hardware video mixing, GPU shader processing, and tactile MIDI
 
 ```mermaid
 flowchart TB
-    subgraph automidi["automidi (Teensy 4.1)"]
+    subgraph automidi[automidi - Teensy 4.1]
         ENC[9 Encoders + OLEDs]
         BTN[12 Buttons + 8 LEDs]
         FFT[Audio FFT Display]
     end
 
-    subgraph autowaaave["autowaaave (Pi 3B+)"]
+    subgraph autowaaave[autowaaave - Pi 3B+]
         BRIDGE[video_bridge.py]
         SHADER[openFrameworks Shaders]
         AUDIO[HiFiBerry Line-In]
     end
 
-    subgraph autoclip["autoclip (Pi 5)"]
+    subgraph autoclip[autoclip - Pi 5]
         PLAYER[Clip Player]
         MIXER[Video Mixer]
-        CAPTURE[3× Composite Capture]
+        CAPTURE[3x Composite Capture]
     end
 
-    subgraph external["External"]
+    subgraph external[External]
         SOURCES[Video Sources]
         HDMI[HDMI Output]
     end
 
-    %% USB connections (Teensy to autowaaave)
     automidi -->|USB MIDI| SHADER
-    automidi <-->|USB Serial| BRIDGE
+    automidi -->|USB Serial| BRIDGE
+    BRIDGE -->|Serial to UDP| automidi
 
-    %% Network connections (autowaaave to autoclip)
-    BRIDGE <-->|UDP Commands/State| autoclip
+    BRIDGE -->|UDP Commands| autoclip
+    autoclip -->|UDP State| BRIDGE
     autoclip -->|TCP Video Stream| SHADER
 
-    %% Video flow
     SOURCES --> CAPTURE
     PLAYER --> MIXER
     CAPTURE --> MIXER
     MIXER -->|720x480 H.264| SHADER
     SHADER --> HDMI
 
-    %% Audio
     AUDIO --> SHADER
 ```
 
@@ -71,37 +69,29 @@ Video clip player and hardware mixer. Plays MP4 clips from SD card, captures 3 c
 ## Signal Flow
 
 ```mermaid
-flowchart TB
-    subgraph row1[" "]
-        direction LR
-        subgraph sources["Video Sources"]
-            COMP1[Composite 1]
-            COMP2[Composite 2]
-            COMP3[Composite 3]
-            CLIPS[(MP4 Clips)]
-        end
-
-        subgraph autoclip["autoclip (Pi 5)"]
-            CAP[USB Capture]
-            PLAY[Clip Player]
-            MIX[Video Mixer]
-            ENC[H.264 Encode]
-        end
+flowchart LR
+    subgraph sources[Video Sources]
+        COMP1[Composite 1]
+        COMP2[Composite 2]
+        COMP3[Composite 3]
+        CLIPS[(MP4 Clips)]
     end
 
-    subgraph row2[" "]
-        direction LR
-        subgraph autowaaave["autowaaave (Pi 3B+)"]
-            DEC[Decode Stream]
-            FB[Feedback Buffer]
-            SHADER[GPU Shaders]
-            SHARP[Sharpen]
-        end
-
-        subgraph output["Output"]
-            HDMI[HDMI Display]
-        end
+    subgraph autoclip[autoclip - Pi 5]
+        CAP[USB Capture]
+        PLAY[Clip Player]
+        MIX[Video Mixer]
+        ENC[H.264 Encode]
     end
+
+    subgraph autowaaave[autowaaave - Pi 3B+]
+        DEC[Decode Stream]
+        FB[Feedback Buffer]
+        SHADER[GPU Shaders]
+        SHARP[Sharpen]
+    end
+
+    HDMI[HDMI Display]
 
     COMP1 --> CAP
     COMP2 --> CAP
@@ -110,14 +100,14 @@ flowchart TB
 
     CAP --> MIX
     PLAY --> MIX
-    MIX -->|Crossfade + Luma Key| ENC
-    ENC -->|TCP :1236| DEC
+    MIX --> ENC
+    ENC -->|TCP 1236| DEC
 
     DEC --> FB
-    FB -->|60 frames| SHADER
-    SHADER -->|UV Warp, HSB, Feedback| SHARP
+    FB --> SHADER
+    SHADER --> SHARP
     SHARP --> HDMI
-    SHADER -.->|Feedback Loop| FB
+    SHADER -.-> FB
 ```
 
 | Stage | Device | Process |
