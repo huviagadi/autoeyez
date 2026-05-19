@@ -71,30 +71,36 @@ Video clip player and hardware mixer. Plays MP4 clips from SD card, captures 3 c
 ## Signal Flow
 
 ```mermaid
-flowchart LR
-    subgraph sources["Video Sources"]
-        COMP1[Composite 1]
-        COMP2[Composite 2]
-        COMP3[Composite 3]
-        CLIPS[(MP4 Clips)]
+flowchart TB
+    subgraph row1[" "]
+        direction LR
+        subgraph sources["Video Sources"]
+            COMP1[Composite 1]
+            COMP2[Composite 2]
+            COMP3[Composite 3]
+            CLIPS[(MP4 Clips)]
+        end
+
+        subgraph autoclip["autoclip (Pi 5)"]
+            CAP[USB Capture]
+            PLAY[Clip Player]
+            MIX[Video Mixer]
+            ENC[H.264 Encode]
+        end
     end
 
-    subgraph autoclip["autoclip (Pi 5)"]
-        CAP[USB Capture]
-        PLAY[Clip Player]
-        MIX[Video Mixer]
-        ENC[H.264 Encode]
-    end
+    subgraph row2[" "]
+        direction LR
+        subgraph autowaaave["autowaaave (Pi 3B+)"]
+            DEC[Decode Stream]
+            FB[Feedback Buffer]
+            SHADER[GPU Shaders]
+            SHARP[Sharpen]
+        end
 
-    subgraph autowaaave["autowaaave (Pi 3B+)"]
-        DEC[Decode Stream]
-        FB[Feedback Buffer]
-        SHADER[GPU Shaders]
-        SHARP[Sharpen]
-    end
-
-    subgraph output["Output"]
-        HDMI[HDMI Display]
+        subgraph output["Output"]
+            HDMI[HDMI Display]
+        end
     end
 
     COMP1 --> CAP
