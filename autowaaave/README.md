@@ -42,9 +42,9 @@ Video from autoclip (TCP:1236)
 
 ## Resolution
 
-- Input: 720×480 from autoclip (scaled to 640×480)
-- Processing: 640×480 @ 30fps
-- Output: HDMI (configurable aspect ratio)
+- Input: 720×480 from autoclip
+- Processing: 640×480 @ 30fps (internal FBOs)
+- Output: 1280×720 HDMI (upscaled)
 
 ## Shader Parameters
 
