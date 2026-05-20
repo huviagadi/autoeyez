@@ -108,7 +108,7 @@ make -j4
 The video stream from autoclip needs a virtual video device:
 
 ```bash
-sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="autoclip" exclusive_caps=1
+sudo modprobe v4l2loopback devices=1 video_nr=10 card_label="autoclip" exclusive_caps=1 max_buffers=2
 ```
 
 Add to `/etc/modules-load.d/v4l2loopback.conf`:
@@ -118,7 +118,7 @@ v4l2loopback
 
 Add to `/etc/modprobe.d/v4l2loopback.conf`:
 ```
-options v4l2loopback devices=1 video_nr=10 card_label="autoclip" exclusive_caps=1
+options v4l2loopback devices=1 video_nr=10 card_label="autoclip" exclusive_caps=1 max_buffers=2
 ```
 
 ### 8. Install Services
@@ -198,7 +198,7 @@ Typical sources:
 
 ## HDMI Output
 
-Connect HDMI to your display or video mixer. The processed video appears here at 640×480 (or configured resolution).
+Connect HDMI to your display or video mixer. The processed video appears here at 720×480 (upscaled to 720p).
 
 For composite output (if needed), add to `/boot/config.txt`:
 ```
@@ -244,12 +244,12 @@ ls /dev/ttyACM*
 | No audio reactivity | HiFiBerry not detected | Check config.txt, asound.conf |
 | MIDI not received | Wrong port | Check OF opens MIDI port 1 |
 | Bridge not connecting | Teensy not detected | Check /dev/ttyACM0 exists |
-| High latency | v4l2loopback misconfigured | Check exclusive_caps=1 |
+| High latency | v4l2loopback misconfigured | Check exclusive_caps=1, max_buffers=2 |
 
 ## Performance Notes
 
-- Pi 3B+ GPU handles 640×480 @ 30fps comfortably
-- Higher resolutions may cause frame drops
+- Pi 3B+ GPU handles 720×480 @ 30fps (test for frame drops)
+- Monitor framerate if GPU struggles
 - Shader complexity affects performance
 - Monitor GPU temperature: `vcgencmd measure_temp`
 

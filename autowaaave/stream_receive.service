@@ -4,7 +4,7 @@ After=network.target
 
 [Service]
 ExecStartPre=/bin/sleep 3
-ExecStart=/usr/bin/ffmpeg -fflags nobuffer -flags low_delay -f mpegts -listen 1 -i tcp://0.0.0.0:1236 -vf scale=720:480 -pix_fmt rgb24 -f v4l2 /dev/video10
+ExecStart=/usr/bin/ffmpeg -fflags nobuffer -flags low_delay -f mpegts -listen 1 -i tcp://0.0.0.0:1236 -pix_fmt rgb24 -f v4l2 /dev/video10
 Restart=always
 RestartSec=5
 User=pi

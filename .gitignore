@@ -31,3 +31,6 @@ deprecated/
 *.lst
 *.sym
 build/
+
+# Backup files
+*.bak

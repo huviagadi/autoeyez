@@ -1,5 +1,7 @@
 # autoeyez — Modular Video Synthesis System
 
+**Version 0.2.0**
+
 A three-component real-time video synthesis and feedback system built around Raspberry Pi and Teensy hardware. Designed for live visual performance with hands-on control.
 
 ## System Overview
@@ -108,16 +110,15 @@ flowchart LR
     SHADER -.-> FB
 ```
 
-| Stage | Device | Process |
-|-------|--------|---------|
-| 1. Capture | autoclip | USB capture cards decode composite video (640×480 MJPEG) |
-| 2. Playback | autoclip | MP4 clips decoded via ffmpeg (720×576) |
-| 3. Mixing | autoclip | A/B crossfade + luma key compositing |
-| 4. Streaming | autoclip | H.264 encode → TCP to autowaaave (720×480) |
-| 5. Feedback | autowaaave | 60-frame circular buffer (2 sec delay) |
-| 6. Shaders | autowaaave | UV displacement, HSB manipulation, temporal filter |
-| 7. Sharpen | autowaaave | Optional sharpening post-process |
-| 8. Output | autowaaave | Final frame to HDMI display |
+| Stage | Device | Resolution | Process |
+|-------|--------|------------|---------|
+| 1. Capture | autoclip | 640×480 | USB capture cards decode composite video (MJPEG) |
+| 2. Playback | autoclip | 720×576 | MP4 clips decoded via ffmpeg |
+| 3. Mixing | autoclip | 720×480 | A/B crossfade + luma key compositing |
+| 4. Streaming | autoclip→autowaaave | 720×480 | H.264 encode → TCP (port 1236) |
+| 5. Processing | autowaaave | 720×480 | GPU shaders: UV warp, HSB, temporal filter |
+| 6. Feedback | autowaaave | 720×480 | 60-frame circular buffer (2 sec delay) |
+| 7. Output | autowaaave | 1280×720 | Upscaled to 720p HDMI |
 
 ## Features
 
@@ -164,6 +165,34 @@ See `BUILDME.md` for full hardware assembly instructions.
 6. Power on all three — system auto-syncs on boot
 
 **Note:** The Teensy has no direct connection to autoclip. All communication flows through autowaaave's video_bridge.py which translates serial↔UDP.
+
+## Changelog
+
+### v0.2.0 (2026-05-19)
+- Upgraded processing resolution from 640x480 to 720x480
+- Native 720x480 capture with no scaling artifacts
+- Fixed v4l2loopback freeze issue (max_buffers=2)
+- HDMI output at 720p for LZX Videomancer compatibility
+- Added thread coordination for clip playback
+
+### v0.1.0 (2026-05-16)
+- Initial public release
+- automidi 9-encoder MIDI controller with OLEDs
+- autowaaave GPU shader feedback processor
+- autoclip video mixer with 3 composite inputs
+- 32 video patches + 32 audio-reactive patches
+- P-lock parameter automation (8-second loop)
+
+## Roadmap
+
+Potential future improvements:
+
+- **Higher resolution processing** — Test 960x540 or 1280x720 on Pi 3B+
+- **Pi 4/5 port** — Unlock higher resolutions and framerates
+- **Additional shader effects** — Edge detection, pixelation, color quantization
+- **OSC control** — Network control for integration with other software
+- **Recording** — Capture output to SD card
+- **Web interface** — Remote parameter control and monitoring
 
 ## License
 

@@ -96,7 +96,7 @@
 // =============================================================================
 
 // Resolution switch: 0 = 320×240 (lower res, more delay frames)
-//                    1 = 640×480 (higher res, standard delay)
+//                    1 = 720×480 (higher res, standard delay)
 bool scaleswitch=1;
 
 // Frame buffer length for delay/feedback (60 frames @ 30fps = 2 seconds)
@@ -174,7 +174,7 @@ int fb0_delayamount=0;
 
 //dummy variables for midi control
 
-int width=640;
+int width=720;
 int height=480;
 
 
@@ -500,10 +500,10 @@ void ofApp::draw() {
         }
         if(inputswitch==1){
             if(hdmi_aspect_ratio_switch==0){
-                cam1.draw(0,0,640,480);
+                cam1.draw(0,0,width,height);
             }
             if(hdmi_aspect_ratio_switch==1){
-                aspect_fix_fbo.draw(0,0,640,480);
+                aspect_fix_fbo.draw(0,0,width,height);
             }
         }
     }
@@ -635,13 +635,13 @@ void ofApp::draw() {
         }
         if(inputswitch==1){
             if(hdmi_aspect_ratio_switch==0){
-                cam1.draw(0,0,640,480);
+                cam1.draw(0,0,width,height);
             }
             if(hdmi_aspect_ratio_switch==1){
-                aspect_fix_fbo.draw(0,0,640,480);
+                aspect_fix_fbo.draw(0,0,width,height);
             }
         }
-        
+
         dry_framebuffer.begin();
         //framebuffer0.draw(0,0);
         outputFbo.draw(0,0);
