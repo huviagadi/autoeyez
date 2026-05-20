@@ -118,6 +118,9 @@ class VideoPlayer:
         self.current_frame = np.zeros((H, W, 3), dtype=np.uint8)
         self.frame_lock = threading.Lock()
 
+        # Thread coordination - signals when frame reader has finished
+        self.reader_done = threading.Event()
+
         # Playback timing
         self.time_pos = 0
         self.duration = 0
@@ -179,6 +182,9 @@ class VideoPlayer:
         """
         # Stop any existing playback first
         self.stop()
+
+        # Clear reader done flag before starting new playback
+        self.reader_done.clear()
 
         if not self.clips:
             return
@@ -248,6 +254,9 @@ class VideoPlayer:
                     break
             except:
                 break
+
+        # Signal that frame reader has finished
+        self.reader_done.set()
 
     def get_frame(self):
         """
@@ -379,6 +388,8 @@ class VideoPlayer:
 
             # --- Handle clip end (ffmpeg process exited) ---
             if not self.paused and self.process and self.process.poll() is not None:
+                # Wait for frame reader thread to finish before restarting
+                self.reader_done.wait(timeout=1.0)
                 if self.loop:
                     # Restart same clip from beginning
                     self.play_current()
