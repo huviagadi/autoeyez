@@ -190,9 +190,8 @@ Potential future improvements:
 - **Higher resolution processing** — Test 960x540 or 1280x720 on Pi 3B+
 - **Pi 4/5 port** — Unlock higher resolutions and framerates
 - **Additional shader effects** — Edge detection, pixelation, color quantization
-- **OSC control** — Network control for integration with other software
-- **Recording** — Capture output to SD card
-- **Web interface** — Remote parameter control and monitoring
+- **LFO modulation** — USB MIDI-synced LFOs for parameter automation
+- **Recording** — Capture output to SD card (if CPU headroom allows)
 
 ## License
 
