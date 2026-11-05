@@ -1,142 +1,82 @@
+#!/usr/bin/env python3
 """
-video_player.py — MP4 Clip Playback Engine for autoclip
-Part of the autoeyez video synthesis system
-
-This module handles all clip playback functionality for the autoclip Pi 5.
-It manages a directory of MP4 clips and provides frame-by-frame access to
-the currently playing video for use by the mixer.
-
-Architecture:
-    /boot/firmware/clips/
-        → ffmpeg subprocess (decode + scale)
-        → raw RGB frames → numpy array
-        → mixer.py calls get_frame()
-
-    video_control.py
-        → JSON commands → /tmp/player_cmd.json
-        → THIS SCRIPT polls and executes
-        → writes state → /tmp/player_state.json
-        → video_control.py reads and sends to automidi
-
-Playback features:
-    - Play/pause with position memory
-    - Loop current clip or auto-advance
-    - Next/previous clip navigation
-    - Jump to specific clip by index
-    - Seek support via ffmpeg -ss
-
-Frame pipeline:
-    - ffmpeg decodes MP4 at realtime rate (-re flag)
-    - Output scaled to 720x576 (PAL resolution)
-    - Raw RGB24 piped to stdout
-    - Background thread reads frames into numpy array
-    - Thread-safe access via lock for mixer
-
-IPC files:
-    /tmp/player_cmd.json   - Commands from video_control.py (we read)
-    /tmp/player_state.json - Current state for video_control.py (we write)
+video_player.py — PyAV-based Clip Playback for autoclip
+With event-driven frame handoff for reduced latency.
 """
 
-import subprocess
 import os
 import time
 import json
-import numpy as np
+import socket
 import threading
+import numpy as np
+import av
 
-# =============================================================================
-# CONFIGURATION
-# =============================================================================
+CLIPS_DIR = '/home/admin/clips/'
+SEEK_CLIPS_DIR = '/home/admin/clips_seek/'
+STATE_FILE = '/tmp/player_state.json'
+CMD_FILE = '/tmp/player_cmd.json'
+SEEK_SOCKET = '/tmp/player_seek.sock'
 
-# Clip storage location - on boot partition for easy access via card reader
-CLIPS_DIR  = '/boot/firmware/clips/'
-
-# IPC file paths for communication with video_control.py
-STATE_FILE = '/tmp/player_state.json'  # We write our state here
-CMD_FILE   = '/tmp/player_cmd.json'    # We read commands from here
-
-# Output resolution (PAL standard for composite compatibility)
 W, H = 720, 576
-
-# =============================================================================
-# UTILITY FUNCTIONS
-# =============================================================================
+DEFAULT_CLIP = 'LIGHTWALL'
+TARGET_FPS = 30
+FRAME_TIME = 1.0 / TARGET_FPS
 
 def get_clips():
-    """
-    Get sorted list of MP4 files from clips directory.
-
-    Clips are sorted alphabetically. Use numeric prefixes in filenames
-    to control playback order (e.g., 01_intro.mp4, 02_main.mp4).
-
-    Returns:
-        List of MP4 filenames sorted alphabetically
-    """
+    if not os.path.exists(CLIPS_DIR):
+        return []
     return sorted([f for f in os.listdir(CLIPS_DIR) if f.endswith('.mp4')])
 
-# =============================================================================
-# VIDEO PLAYER CLASS
-# =============================================================================
-
 class VideoPlayer:
-    """
-    Manages MP4 clip playback via ffmpeg subprocess.
-
-    Provides frame-by-frame access to decoded video for the mixer to
-    composite with other sources. Handles playback control commands
-    received via JSON IPC from video_control.py.
-
-    Attributes:
-        clips: List of available MP4 filenames
-        index: Current clip index in the list
-        paused: True if playback is paused
-        pause_pos: Playback position (seconds) when paused, for resume
-        loop: True if current clip should loop, False to auto-advance
-        process: Active ffmpeg subprocess or None
-        current_frame: Latest decoded frame as numpy array (H, W, 3)
-        frame_lock: Threading lock for safe frame access
-        time_pos: Current playback position in seconds
-        duration: Total duration of current clip in seconds
-        start_time: Wall-clock time when playback started (for position calc)
-    """
-
     def __init__(self):
-        """
-        Initialize the video player.
-
-        Loads clip list, sets up initial state, and prepares a blank
-        frame buffer. Does not start playback - call run() for that.
-        """
         self.clips = get_clips()
-        self.index = 0
+        self.index = self._find_default()
         self.paused = False
-        self.pause_pos = 0        # Position to resume from after pause
         self.loop = False
-        self.process = None
-
-        # Frame buffer - initialized to black, updated by reader thread
+        
         self.current_frame = np.zeros((H, W, 3), dtype=np.uint8)
         self.frame_lock = threading.Lock()
-
-        # Thread coordination - signals when frame reader has finished
-        self.reader_done = threading.Event()
-
-        # Playback timing
-        self.time_pos = 0
-        self.duration = 0
-        self.start_time = None
-
-        # Write initial state so video_control knows we're alive
+        self.frame_ready = threading.Event()  # NEW: signal when frame is ready
+        
+        self.time_pos = 0.0
+        self.duration = 0.0
+        self.frame_period = 1.0/30
+        self.next_frame_time = time.perf_counter()
+        self.container = None
+        self.stream = None
+        
+        self.running = True
+        self.seek_request = None
+        self.seek_decode_target = None
+        self.seek_started_at = None
+        self.seek_lock = threading.Lock()
+        self.stutter_start = 0.0
+        self.stutter_lengths = {'normal': 0, 'reverse': 0}
+        self.stutter_indices = {'normal': 0, 'reverse': 0}
+        self.stutter_last_control = 'normal'
+        self.stutter_buffer = []
+        self.stutter_release = []
+        self.stutter_replaying = False
+        
+        self._init_socket()
         self.write_state()
-
+    
+    def _init_socket(self):
+        if os.path.exists(SEEK_SOCKET):
+            os.remove(SEEK_SOCKET)
+        self.sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self.sock.bind(SEEK_SOCKET)
+        self.sock.setblocking(False)
+        os.chmod(SEEK_SOCKET, 0o666)
+    
+    def _find_default(self):
+        for i, c in enumerate(self.clips):
+            if DEFAULT_CLIP.upper() in c.upper():
+                return i
+        return 0
+    
     def write_state(self):
-        """
-        Write current player state to JSON file for video_control.py.
-
-        State includes current clip info, playback position, and flags.
-        Called whenever state changes (clip change, pause, loop toggle).
-        video_control.py polls this file and sends updates to automidi.
-        """
         try:
             with open(STATE_FILE, 'w') as f:
                 json.dump({
@@ -145,274 +85,330 @@ class VideoPlayer:
                     'loop': self.loop,
                     'clip': self.clips[self.index] if self.clips else '',
                     'time_pos': self.time_pos,
-                    'duration': self.duration
+                    'duration': self.duration,
+                    'frame_period': self.frame_period,
+                    'stutter': max(self.stutter_lengths.values()),
+                    'stutter_controls': self.stutter_lengths
                 }, f)
         except:
-            pass  # Silently fail - state updates are best-effort
-
-    def get_duration(self, clip_path):
-        """
-        Get duration of a video file using ffprobe.
-
-        Args:
-            clip_path: Full path to the MP4 file
-
-        Returns:
-            Duration in seconds as float, or 0 if probe fails
-        """
-        try:
-            result = subprocess.run(
-                ['ffprobe', '-v', 'error', '-show_entries', 'format=duration',
-                 '-of', 'default=noprint_wrappers=1:nokey=1', clip_path],
-                capture_output=True, text=True)
-            return float(result.stdout.strip())
-        except:
-            return 0
-
-    def play_current(self, seek=0):
-        """
-        Start playback of the current clip.
-
-        Stops any existing playback, then launches ffmpeg to decode
-        the current clip and pipe raw frames to stdout. A background
-        thread reads these frames into the current_frame buffer.
-
-        Args:
-            seek: Starting position in seconds (default 0 = beginning)
-        """
-        # Stop any existing playback first
-        self.stop()
-
-        # Clear reader done flag before starting new playback
-        self.reader_done.clear()
-
+            pass
+    
+    def open_clip(self):
+        self.seek_decode_target = None
+        self.stutter_lengths = {'normal': 0, 'reverse': 0}
+        self.stutter_indices = {'normal': 0, 'reverse': 0}
+        self.stutter_buffer = []
+        self.stutter_release = []
+        self.stutter_replaying = False
+        if self.container:
+            self.container.close()
+            self.container = None
+        
         if not self.clips:
             return
+        
+        source_path = os.path.join(CLIPS_DIR, self.clips[self.index])
+        seek_path = os.path.join(SEEK_CLIPS_DIR, self.clips[self.index])
+        path = seek_path if os.path.exists(seek_path) else source_path
+        try:
+            self.container = av.open(path)
+            self.stream = self.container.streams.video[0]
+            self.stream.thread_type = 'AUTO'
+            self.duration = float(self.stream.duration * self.stream.time_base) if self.stream.duration else 0
+            self.frame_period = 1.0 / float(self.stream.average_rate) if self.stream.average_rate else 1.0/30
+            self.next_frame_time = time.perf_counter()
+            self.time_pos = 0.0
+            source_kind = 'seek' if path == seek_path else 'original'
+            print(f'Opened: {self.clips[self.index]} ({self.duration:.1f}s, {source_kind})', flush=True)
+        except Exception as e:
+            print(f'Failed to open: {e}', flush=True)
+            self.container = None
+    
+    def seek(self, position):
+        if self.container and self.duration > 0:
+            with self.seek_lock:
+                self.seek_request = position
+                self.seek_started_at = time.perf_counter()
+    
+    def _do_seek(self, position):
+        target_sec = min(max(0.0, position * self.duration),
+                         max(0.0, self.duration - self.frame_period))
+        target_pts = int(target_sec / self.stream.time_base)
+        try:
+            self.container.seek(target_pts, stream=self.stream)
+            # seek() lands on the preceding keyframe. Decode forward before
+            # displaying a frame so note velocity retains its fine resolution.
+            self.seek_decode_target = target_sec
+            self.stutter_start = target_sec
+            self.stutter_buffer = []
+            self.stutter_release = []
+            self.stutter_indices = {'normal': 0, 'reverse': 0}
+            self.stutter_replaying = False
+            print(f'Seek: {position*100:.0f}% -> {target_sec:.2f}s', flush=True)
+        except Exception as e:
+            print(f'Seek failed: {e}', flush=True)
 
-        clip = os.path.join(CLIPS_DIR, self.clips[self.index])
+    def set_stutter(self, value, control='normal'):
+        """Set one lane of the shared two-head 30-frame stutter buffer."""
+        if control not in self.stutter_lengths:
+            return
+        value = max(0, min(30, int(value)))
+        was_active = any(self.stutter_lengths.values())
+        if value == 0:
+            released_index = self.stutter_indices[control]
+            self.stutter_lengths[control] = 0
+            if was_active and not any(self.stutter_lengths.values()):
+                if self.stutter_replaying:
+                    start = min(released_index, len(self.stutter_buffer))
+                    self.stutter_release = self.stutter_buffer[start:]
+                self.stutter_buffer = []
+                self.stutter_indices = {'normal': 0, 'reverse': 0}
+                self.stutter_replaying = False
+                print('Stutter off', flush=True)
+            else:
+                print('Stutter {} lane off'.format(control), flush=True)
+            return
 
-        # Get clip duration for progress tracking
-        self.duration = self.get_duration(clip)
-        self.time_pos = seek
-        self.start_time = time.time() - seek  # Adjust for seek offset
-
-        # Build ffmpeg command
-        # -re: Read input at native framerate (realtime playback)
-        cmd = [
-            'ffmpeg', '-re',
-        ]
-
-        # Add seek position if resuming
-        if seek > 0:
-            cmd += ['-ss', str(seek)]
-
-        cmd += [
-            '-i', clip,
-            '-vf', 'scale={}:{}'.format(W, H),  # Scale to output resolution
-            '-pix_fmt', 'rgb24',                 # Raw RGB, 3 bytes per pixel
-            '-f', 'rawvideo', 'pipe:1'           # Output raw frames to stdout
-        ]
-
-        # Launch ffmpeg subprocess
-        self.process = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL  # Suppress ffmpeg logging
-        )
-
-        # Start background thread to read frames
-        threading.Thread(target=self._read_frames, daemon=True).start()
-        self.write_state()
-
-    def _read_frames(self):
-        """
-        Background thread: read raw frames from ffmpeg stdout.
-
-        Runs continuously while ffmpeg is active, reading exactly
-        one frame at a time (W * H * 3 bytes) and updating the
-        current_frame buffer. Thread-safe via frame_lock.
-
-        This method is launched as a daemon thread by play_current().
-        """
-        frame_size = W * H * 3  # RGB24 = 3 bytes per pixel
-        proc = self.process     # Local reference in case process changes
-
-        while proc and proc.poll() is None:
-            try:
-                # Read exactly one frame worth of data
-                raw = proc.stdout.read(frame_size)
-
-                if len(raw) == frame_size:
-                    # Decode raw bytes to numpy array
-                    frame = np.frombuffer(raw, dtype=np.uint8).reshape((H, W, 3))
-
-                    # Thread-safe update of shared frame buffer
-                    with self.frame_lock:
-                        self.current_frame = frame.copy()
-                elif len(raw) == 0:
-                    # End of stream (clip finished)
-                    break
-            except:
-                break
-
-        # Signal that frame reader has finished
-        self.reader_done.set()
-
+        if not was_active:
+            self.stutter_start = max(0.0, min(self.time_pos, self.duration))
+            self.stutter_buffer = []
+            self.stutter_indices = {'normal': 0, 'reverse': 0}
+            self.stutter_release = []
+            self.stutter_replaying = False
+        self.stutter_lengths[control] = value
+        self.stutter_last_control = control
+        if len(self.stutter_buffer) < max(self.stutter_lengths.values()):
+            self.stutter_replaying = False
+        print('Stutter {}: start={:.3f}s length={} frames ({:.3f}s)'.format(
+            control, self.stutter_start, value, value / TARGET_FPS), flush=True)
+    
     def get_frame(self):
-        """
-        Get the current video frame (thread-safe).
-
-        Called by mixer.py to get the latest decoded frame for
-        compositing. Returns a copy to avoid race conditions.
-
-        Returns:
-            numpy array of shape (H, W, 3) with RGB pixel data
-        """
         with self.frame_lock:
             return self.current_frame.copy()
-
-    def stop(self):
-        """
-        Stop the current ffmpeg playback subprocess.
-
-        Terminates gracefully with SIGTERM, then SIGKILL if needed.
-        Called before starting a new clip or when pausing.
-        """
-        if self.process:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=2)  # Wait for clean exit
-            except:
-                self.process.kill()  # Force kill if hung
-            self.process = None
-
+    
+    def wait_frame(self, timeout=0.05):
+        """Wait for next frame with timeout. Returns True if frame ready."""
+        return self.frame_ready.wait(timeout)
+    
     def next(self):
-        """
-        Advance to the next clip in the list (wraps around).
-
-        Resets pause position and starts playback from beginning.
-        """
-        self.index = (self.index + 1) % len(self.clips)
-        self.pause_pos = 0
-        self.play_current()
-
+        self.index = (self.index + 1) % len(self.clips) if self.clips else 0
+        self.open_clip()
+        self.write_state()
+    
     def prev(self):
-        """
-        Go to the previous clip in the list (wraps around).
-
-        Resets pause position and starts playback from beginning.
-        """
-        self.index = (self.index - 1) % len(self.clips)
-        self.pause_pos = 0
-        self.play_current()
-
-    def play_index(self, i):
-        """
-        Jump to a specific clip by index.
-
-        Args:
-            i: Clip index (wraps around if out of range)
-        """
-        self.index = i % len(self.clips)
-        self.play_current()
-        self.pause_pos = 0
-
+        self.index = (self.index - 1) % len(self.clips) if self.clips else 0
+        self.open_clip()
+        self.write_state()
+    
     def handle_cmd(self, cmd):
-        """
-        Execute a command received via IPC.
-
-        Commands arrive as dictionaries with an 'action' key.
-        This method dispatches to the appropriate handler.
-
-        Args:
-            cmd: Dictionary with 'action' and optional parameters
-                 Actions: next, prev, play_index, pause, play,
-                         loop_on, loop_off
-        """
         action = cmd.get('action')
-
         if action == 'next':
             self.next()
-
         elif action == 'prev':
             self.prev()
-
         elif action == 'play_index':
-            # Jump to specific clip - index in 'index' field
-            self.play_index(cmd.get('index', 0))
-
-        elif action == 'pause':
-            # Pause playback, save position for resume
-            self.paused = True
-            self.pause_pos = self.time_pos
-            self.stop()
+            self.index = cmd.get('index', 0) % len(self.clips) if self.clips else 0
+            self.open_clip()
             self.write_state()
-
-        elif action == 'play':
-            # Resume from paused position
+        elif action == 'play_loop':
+            # Restore the clip and loop setting together when loading a patch.
+            self.index = cmd.get('index', 0) % len(self.clips) if self.clips else 0
+            self.loop = bool(cmd.get('loop', False))
             self.paused = False
-            self.play_current(seek=self.pause_pos)
-
+            self.open_clip()
+            self.write_state()
         elif action == 'loop_on':
             self.loop = True
             self.write_state()
-
         elif action == 'loop_off':
             self.loop = False
             self.write_state()
-
+        elif action == 'pause':
+            self.paused = True
+            self.write_state()
+        elif action == 'play':
+            self.paused = False
+            self.write_state()
+        elif action == 'cue_preview':
+            # Hold the requested frame for keypad cue editing. The decode loop
+            # is allowed to land one frame while paused.
+            self.paused = True
+            self.seek(cmd.get('position', 0.0))
+            self.write_state()
+    
     def run(self):
-        """
-        Main run loop - start playback and process commands.
-
-        Starts playing the first clip, then enters infinite loop:
-        1. Poll for commands from video_control.py
-        2. Handle end-of-clip (loop or advance)
-        3. Update playback position for state file
-
-        This method never returns - it's the main entry point.
-        """
-        self.play_current()
-        last_time_write = 0  # Rate-limit state writes
-
-        while True:
-            # --- Check for incoming commands ---
+        self.open_clip()
+        last_state_write = 0
+        frame_count = 0
+        fps_start = time.time()
+        
+        while self.running:
+            now = time.time()
+            
+            # Check for seek commands via socket
+            try:
+                while True:
+                    data = self.sock.recv(256)
+                    message = json.loads(data.decode())
+                    if message.get('action') == 'stutter_control':
+                        self.set_stutter(message.get('value', 0),
+                                         message.get('control', 'normal'))
+                    elif message.get('action') == 'stutter':
+                        self.set_stutter(message.get('value', 0), 'normal')
+                    elif message.get('action') == 'play_index':
+                        self.handle_cmd(message)
+                    elif message.get('action') in ('cue_preview', 'play', 'pause'):
+                        self.handle_cmd(message)
+                    elif 'position' in message:
+                        self.seek(message['position'])
+            except BlockingIOError:
+                pass
+            except:
+                pass
+            
+            # Check for file commands
             if os.path.exists(CMD_FILE):
                 try:
                     with open(CMD_FILE) as f:
                         cmd = json.load(f)
-                    os.remove(CMD_FILE)  # Consume the command
+                    os.remove(CMD_FILE)
                     self.handle_cmd(cmd)
                 except:
                     pass
+            
+            # Handle seek request
+            with self.seek_lock:
+                if self.seek_request is not None:
+                    self._do_seek(self.seek_request)
+                    self.seek_request = None
+            
+            # Decode next frame if not paused
+            if (not self.paused or self.seek_decode_target is not None) and self.container:
+                replay_arr = None
+                replay_pos = None
+                if self.stutter_release:
+                    replay_arr = self.stutter_release.pop(0)
+                    replay_pos = self.time_pos + self.frame_period
+                elif (any(self.stutter_lengths.values()) and
+                      len(self.stutter_buffer) >= max(self.stutter_lengths.values())):
+                    self.stutter_replaying = True
+                    heads = []
+                    positions = {}
+                    for control, length in self.stutter_lengths.items():
+                        if length <= 0:
+                            continue
+                        index = self.stutter_indices[control] % length
+                        positions[control] = index
+                        heads.append(self.stutter_buffer[index])
+                        self.stutter_indices[control] = (index + 1) % length
+                    replay_arr = heads[0]
+                    if len(heads) == 2:
+                        replay_arr = ((heads[0].astype(np.uint16) +
+                                       heads[1].astype(np.uint16)) // 2).astype(np.uint8)
+                    position_index = positions.get(
+                        self.stutter_last_control, next(iter(positions.values())))
+                    replay_pos = self.stutter_start + position_index / TARGET_FPS
 
-            # --- Handle clip end (ffmpeg process exited) ---
-            if not self.paused and self.process and self.process.poll() is not None:
-                # Wait for frame reader thread to finish before restarting
-                self.reader_done.wait(timeout=1.0)
-                if self.loop:
-                    # Restart same clip from beginning
-                    self.play_current()
-                else:
-                    # Auto-advance to next clip
-                    self.next()
+                if replay_arr is not None:
+                    with self.frame_lock:
+                        self.current_frame = replay_arr
+                    self.frame_ready.set()
+                    self.time_pos = replay_pos
+                    frame_count += 1
+                    self.next_frame_time += self.frame_period
+                    sleep_time = self.next_frame_time - time.perf_counter()
+                    if sleep_time > 0:
+                        time.sleep(sleep_time)
+                    elif sleep_time < -0.1:
+                        self.next_frame_time = time.perf_counter()
+                    time.sleep(0.001)
+                    continue
 
-            # --- Update playback position (~1/second) ---
-            if not self.paused and self.start_time:
-                now = time.time()
-                if now - last_time_write >= 1.0:
-                    # Calculate position from wall-clock time since start
-                    self.time_pos = min(int(now - self.start_time), int(self.duration))
-                    self.write_state()
-                    last_time_write = now
-
-            # Poll interval - 100ms is responsive enough for control
-            time.sleep(0.1)
-
-# =============================================================================
-# ENTRY POINT
-# =============================================================================
+                try:
+                    for frame in self.container.decode(self.stream):
+                        if self.seek_decode_target is not None:
+                            frame_time = (float(frame.pts * self.stream.time_base)
+                                          if frame.pts is not None else None)
+                            if (frame_time is not None and
+                                    frame_time + self.frame_period * 0.5 < self.seek_decode_target):
+                                continue
+                            self.seek_decode_target = None
+                            self.next_frame_time = time.perf_counter()
+                            if self.seek_started_at is not None:
+                                seek_ms = (time.perf_counter() - self.seek_started_at) * 1000.0
+                                print(f'Seek landed: {seek_ms:.1f}ms', flush=True)
+                                self.seek_started_at = None
+                        arr = frame.to_ndarray(format='rgb24')
+                        
+                        if arr.shape[0] != H or arr.shape[1] != W:
+                            from PIL import Image
+                            img = Image.fromarray(arr)
+                            img = img.resize((W, H), Image.BILINEAR)
+                            arr = np.array(img)
+                        
+                        with self.frame_lock:
+                            self.current_frame = arr
+                        
+                        # Signal frame ready
+                        self.frame_ready.set()
+                        
+                        self.time_pos = float(frame.pts * self.stream.time_base) if frame.pts else self.time_pos
+                        frame_count += 1
+                        target_frames = max(self.stutter_lengths.values())
+                        if (target_frames > 0 and
+                                len(self.stutter_buffer) < target_frames):
+                            self.stutter_buffer.append(arr.copy())
+                            if len(self.stutter_buffer) == target_frames:
+                                self.stutter_indices = {'normal': 0, 'reverse': 0}
+                        
+                        # Frame rate pacing
+                        self.next_frame_time += self.frame_period
+                        sleep_time = self.next_frame_time - time.perf_counter()
+                        if sleep_time > 0:
+                            time.sleep(sleep_time)
+                        elif sleep_time < -0.1:  # Fell behind by more than 100ms
+                            self.next_frame_time = time.perf_counter()
+                        break
+                    
+                except av.error.EOFError:
+                    self.seek_decode_target = None
+                    if self.loop:
+                        self.container.seek(0, stream=self.stream)
+                        self.time_pos = 0
+                    else:
+                        self.next()
+                except StopIteration:
+                    self.seek_decode_target = None
+                    if self.loop:
+                        self.container.seek(0, stream=self.stream)
+                        self.time_pos = 0
+                    else:
+                        self.next()
+                except Exception as e:
+                    print(f'Decode error: {e}', flush=True)
+            
+            # Write state periodically
+            if now - last_state_write >= 1.0:
+                self.write_state()
+                last_state_write = now
+                elapsed = now - fps_start
+                if elapsed > 0:
+                    fps = frame_count / elapsed
+                    print(f'FPS: {fps:.1f}', flush=True)
+                frame_count = 0
+                fps_start = now
+            
+            # Minimal sleep when not decoding
+            time.sleep(0.001)
+    
+    def stop(self):
+        self.running = False
+        if self.container:
+            self.container.close()
 
 if __name__ == '__main__':
     player = VideoPlayer()
-    player.run()
+    try:
+        player.run()
+    except KeyboardInterrupt:
+        player.stop()

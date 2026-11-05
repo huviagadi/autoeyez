@@ -1,0 +1,520 @@
+"""
+video_bridge.py — Serial/UDP Bridge for autowaaave
+Part of the autoeyez video synthesis system
+
+This script runs on the autowaaave Pi 3B+ and acts as the central
+communication hub for the autoeyez system. It bridges messages between
+the automidi Teensy controller and the autoclip video processor.
+
+Architecture:
+    automidi (Teensy 4.1)
+        ↔ USB Serial (/dev/ttyACM0)
+        ↔ THIS SCRIPT (on autowaaave)
+        ↔ UDP network
+        ↔ autoclip (Pi 5)
+
+Message flow:
+    Teensy → Serial → video_bridge → UDP:5006 → video_control.py (autoclip)
+    video_control.py → UDP:5005 → video_bridge → Serial → Teensy
+
+Additional features:
+    - Process detection: Waits for the active AUTO_WAAAVE build, then signals
+      the Teensy.
+    - MIDI volume: Handles MIDI CC7 (volume) messages to control system volume
+    - Remote reboot: Listens on UDP:5007 for REBOOT command (TeensyFlaSSH workflow)
+
+Network ports:
+    5005 - Listen for state updates from autoclip (→ forward to Teensy)
+    5006 - autoclip listens here (← we send commands here)
+    5007 - Listen for reboot commands from flash script
+
+Systemd:
+    Runs via video_bridge.service
+"""
+
+import socket
+import time
+import threading
+import serial
+import subprocess
+import os
+import glob
+
+# =============================================================================
+# CONFIGURATION
+# =============================================================================
+
+# Serial connection to Teensy (USB CDC ACM)
+SERIAL_PORT  = '/dev/ttyACM0'
+BAUD         = 115200
+
+# Network settings
+PI2_IP       = '10.0.0.2'    # autoclip IP address
+LISTEN_PORT  = 5005          # Port we listen on for state updates from autoclip
+PI2_CMD_PORT = 5006          # Port autoclip listens on for commands
+
+# FFT file paths (shared with AUTO_WAAAVE)
+FFT_FILE     = '/dev/shm/fft_values'
+FFT_SMOOTH   = '/dev/shm/fft_smooth'
+FFT_ATTACK   = '/dev/shm/fft_attack'
+FFT_DECAY    = '/dev/shm/fft_decay'
+FFT_BDECAY   = '/dev/shm/fft_bdecay'
+FFT_HIT      = '/dev/shm/fft_hit'
+FFT_SLIDE    = '/dev/shm/fft_slide'
+FFT_ENV_UPDATE = '/dev/shm/fft_env_update'  # Written by autowaaave on audio patch load
+VIDEO_OUTPUT_SCRIPT = '/home/admin/set_video_output.sh'
+LUMA_TRACK_FILE = '/dev/shm/luma_track'
+SHOW_OVERLAY_FILE = '/dev/shm/show_overlay'
+
+# =============================================================================
+# SOCKET SETUP
+# =============================================================================
+
+# UDP socket for receiving state updates from autoclip
+udp_recv = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+udp_recv.bind(('0.0.0.0', LISTEN_PORT))  # Listen on all interfaces
+
+# UDP socket for sending commands to autoclip
+udp_send = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+
+# =============================================================================
+# NETWORK FUNCTIONS
+# =============================================================================
+
+def send_to_pi2(cmd):
+    """
+    Send a command string to autoclip via UDP.
+
+    Commands are forwarded to video_control.py on the autoclip Pi,
+    which parses them and writes to the appropriate JSON command file.
+
+    Args:
+        cmd: Command string (e.g., "NEXT", "PLAY:3", "MIX:64")
+    """
+    udp_send.sendto(cmd.encode(), (PI2_IP, PI2_CMD_PORT))
+    print("To Pi2: {}".format(cmd))
+
+
+def udp_to_serial():
+    """
+    Forward UDP messages from autoclip to Teensy serial.
+
+    Runs in background thread. Receives state updates from autoclip
+    (clip names, playback position, etc.) and forwards them to the
+    Teensy for OLED display updates.
+
+    Messages received: LIST:..., FILE:..., POS:..., PAUSE:..., etc.
+    """
+    while True:
+        try:
+            data, addr = udp_recv.recvfrom(4096)
+            msg = data.decode().strip()
+            print("Pi2->Teensy: {}".format(msg))
+            # Forward to Teensy with newline terminator
+            ser.write((msg + '\n').encode())
+        except Exception as e:
+            print("UDP recv error: {}".format(e))
+
+# =============================================================================
+# SERIAL FUNCTIONS
+# =============================================================================
+
+def get_serial():
+    """
+    Connect to Teensy serial port with retry.
+
+    The Teensy appears as /dev/ttyACM0 when connected via USB.
+    This function retries until connection succeeds, handling
+    cases where the Teensy isn't connected or is being flashed.
+
+    Returns:
+        serial.Serial object connected to Teensy
+    """
+    while True:
+        try:
+            ports = [SERIAL_PORT]
+            ports.extend(p for p in sorted(glob.glob('/dev/ttyACM*')) if p != SERIAL_PORT)
+            available = [p for p in ports if os.path.exists(p)]
+            if not available:
+                raise IOError("no Teensy ttyACM device found")
+            port = available[0]
+            s = serial.Serial(port, BAUD, timeout=0.1)
+            print("Serial connected: {}".format(port))
+            return s
+        except Exception as e:
+            print("Serial connect failed: {}".format(e))
+            time.sleep(2)  # Wait before retry
+
+
+def serial_to_pi2():
+    """
+    Forward serial messages from Teensy to autoclip UDP.
+
+    Runs as main thread. Reads characters from serial, buffers
+    until newline, then forwards complete lines to autoclip.
+    Handles reconnection if serial connection drops.
+
+    Commands forwarded: NEXT, PREV, PLAY, PAUSE, CH_A:n, MIX:n, etc.
+    """
+    global ser
+    buf = ''  # Character buffer for building lines
+
+    while True:
+        try:
+            if ser.in_waiting:
+                # Read one character at a time for line buffering
+                char = ser.read().decode('utf-8', errors='ignore')
+
+                if char == '\n':
+                    # Complete line received - process or forward it
+                    line = buf.strip()
+                    if line:
+                        # Intercept FFT commands (don't forward to Pi2)
+                        if line.startswith("FFT:"):
+                            handle_fft(line)
+                        elif line.startswith("FFT_SMOOTH:"):
+                            handle_fft_param(line, FFT_SMOOTH)
+                        elif line.startswith("FFT_ATTACK:"):
+                            handle_fft_param(line, FFT_ATTACK)
+                        elif line.startswith("FFT_DECAY:"):
+                            handle_fft_param(line, FFT_DECAY)
+                        elif line.startswith("FFT_BDECAY:"):
+                            handle_fft_param(line, FFT_BDECAY)
+                        elif line.startswith("FFT_HIT:"):
+                            handle_fft_param(line, FFT_HIT)
+                        elif line.startswith("FFT_SLIDE:"):
+                            handle_fft_param(line, FFT_SLIDE)
+                        elif line.startswith("VIDEO_OUT:"):
+                            handle_video_output(line)
+                        elif line.startswith("LUMA_TRACK:"):
+                            handle_luma_track(line)
+                        elif (line.startswith("HOUSECARD:") or
+                              line.startswith("HOUSELOGO:") or
+                              line.startswith("ANNLOGO:")):
+                            handle_show_overlay(line)
+                        else:
+                            # Forward other commands to autoclip
+                            print("Teensy->Pi2: {}".format(line))
+                            send_to_pi2(line)
+                    buf = ''
+                else:
+                    buf += char
+
+        except Exception as e:
+            # Serial error - likely Teensy disconnected
+            print("Serial error: {}".format(e))
+            time.sleep(1)
+
+            # Reconnect to serial
+            ser = get_serial()
+            buf = ''  # Clear partial buffer
+
+            # Wait for Teensy to initialize
+            time.sleep(2)
+
+            # Resend START signal after reconnection
+            try:
+                ser.write(b'START\n')
+                ser.flush()
+                sync_luma_track()
+                print("Resent START after reconnect")
+            except Exception as e2:
+                print("Failed to resend START: {}".format(e2))
+
+# =============================================================================
+# VIDEO OUTPUT CONTROL
+# =============================================================================
+
+def handle_video_output(cmd):
+    """Apply HDMI/COMP/BOTH mode locally and report the actual mode."""
+    global ser
+    requested = cmd.split(':', 1)[1].strip().upper()
+    if requested not in ('HDMI', 'COMP', 'BOTH'):
+        requested = 'HDMI'
+    actual = 'HDMI'
+    try:
+        result = subprocess.run(
+            [VIDEO_OUTPUT_SCRIPT, requested],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            universal_newlines=True, timeout=12, check=True)
+        output = result.stdout.strip()
+        if output:
+            print("Video output: {}".format(output))
+        actual = requested
+    except Exception as e:
+        print("Video output switch failed: {}".format(e))
+        try:
+            subprocess.run([VIDEO_OUTPUT_SCRIPT, 'HDMI'], timeout=12)
+        except Exception:
+            pass
+    try:
+        ser.write(("VIDEO_OUT:{}\n".format(actual)).encode())
+        ser.flush()
+    except Exception as e:
+        print("Video output state reply failed: {}".format(e))
+
+
+def sync_luma_track():
+    """Default ON each boot; preserve an explicit OFF across bridge reconnects."""
+    try:
+        with open(LUMA_TRACK_FILE, 'x') as state_file:
+            state_file.write('1')
+    except FileExistsError:
+        pass
+    with open(LUMA_TRACK_FILE) as state_file:
+        enabled = state_file.read().strip() != '0'
+    ser.write(('LUMA_TRACK:{}\n'.format('ON' if enabled else 'OFF')).encode())
+    ser.flush()
+
+
+def handle_luma_track(cmd):
+    """Set global adaptive luma tracking and confirm the applied state."""
+    global ser
+    enabled = cmd.split(':', 1)[1].strip().upper() in ('1', 'ON', 'TRUE')
+    try:
+        tmp_path = LUMA_TRACK_FILE + '.tmp'
+        with open(tmp_path, 'w') as state_file:
+            state_file.write('1' if enabled else '0')
+        os.rename(tmp_path, LUMA_TRACK_FILE)
+        reply = 'LUMA_TRACK:{}'.format('ON' if enabled else 'OFF')
+        ser.write((reply + '\n').encode())
+        ser.flush()
+        print(reply)
+    except Exception as e:
+        print("Luma track update failed: {}".format(e))
+
+
+def handle_show_overlay(cmd):
+    """Select one mutually exclusive final-output show card/logo overlay."""
+    name, raw_value = cmd.split(':', 1)
+    modes = {'HOUSECARD': 1, 'HOUSELOGO': 2, 'ANNLOGO': 3}
+    requested_mode = modes[name]
+    enabled = raw_value.strip() in ('1', 'ON', 'TRUE')
+    current_mode = 0
+    try:
+        with open(SHOW_OVERLAY_FILE) as state_file:
+            current_mode = int(state_file.read().strip() or '0')
+    except (IOError, OSError, ValueError):
+        pass
+    new_mode = requested_mode if enabled else (
+        0 if current_mode == requested_mode else current_mode)
+    try:
+        tmp_path = SHOW_OVERLAY_FILE + '.tmp'
+        with open(tmp_path, 'w') as state_file:
+            state_file.write(str(new_mode))
+        os.rename(tmp_path, SHOW_OVERLAY_FILE)
+        print("SHOW_OVERLAY:{}".format(new_mode))
+    except Exception as e:
+        print("Show overlay update failed: {}".format(e))
+
+# =============================================================================
+# TEENSY REBOOT SUPPORT
+# =============================================================================
+
+def reboot_teensy():
+    """
+    Send reboot command to Teensy.
+
+    Used by TeensyFlaSSH workflow to trigger a soft reboot
+    before flashing new firmware.
+    """
+    try:
+        ser.write(b'R\n')
+        ser.flush()
+        print("Reboot command sent")
+    except Exception as e:
+        print("Reboot error: {}".format(e))
+
+
+def listen_for_reboot():
+    """
+    Listen for remote reboot commands via UDP.
+
+    Runs in background thread. The TeensyFlaSSH workflow sends
+    a REBOOT command to port 5007 before attempting to flash
+    new firmware. This triggers reboot_teensy().
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(('0.0.0.0', 5007))
+
+    while True:
+        try:
+            data, addr = sock.recvfrom(1024)
+            if data.decode().strip() == 'REBOOT':
+                print("Reboot requested")
+                reboot_teensy()
+        except Exception as e:
+            print("Reboot listen error: {}".format(e))
+
+# =============================================================================
+# MIDI VOLUME CONTROL
+# =============================================================================
+
+def handle_midi():
+    """
+    Handle MIDI CC7 (volume) messages.
+
+    Runs in background thread. Opens the default MIDI input and
+    listens for Control Change 7 (volume) messages. Maps MIDI
+    value (0-127) to system volume via amixer.
+
+    Volume mapping:
+        0-100   → 0-100% (linear)
+        100-127 → 100-150% (compressed, for boost)
+    """
+    import mido
+
+    while True:
+        try:
+            ports = mido.get_input_names()
+            print("MIDI ports: {}".format(ports))
+
+            with mido.open_input() as port:
+                for msg in port:
+                    # Only handle Control Change 7 (volume)
+                    if msg.type == 'control_change' and msg.control == 7:
+                        val = msg.value
+
+                        # Map MIDI value to volume percentage
+                        if val <= 100:
+                            vol = val  # Linear 0-100
+                        else:
+                            # Compress 101-127 into 100-150 range (boost)
+                            vol = 100 + int((val - 100) / 27.0 * 50)
+
+                        vol = min(150, vol)  # Cap at 150%
+
+                        # Set system volume via amixer
+                        subprocess.run(['amixer', 'set', 'Master', '{}%'.format(vol)])
+
+        except Exception as e:
+            print("MIDI error: {}".format(e))
+            time.sleep(2)  # Wait before retry
+
+# =============================================================================
+# FFT DATA HANDLING
+# =============================================================================
+
+def handle_fft(cmd):
+    """
+    Write FFT band values to file for AUTO_WAAAVE to read.
+    Format: "FFT:low,mid,high" → writes "low mid high" to file
+    Uses atomic write (write to temp, then rename) to prevent race conditions.
+    """
+    try:
+        parts = cmd[4:].split(",")
+        if len(parts) == 3:
+            tmp_path = FFT_FILE + ".tmp"
+            with open(tmp_path, "w") as f:
+                f.write("{} {} {}".format(parts[0], parts[1], parts[2]))
+            os.rename(tmp_path, FFT_FILE)
+    except Exception as e:
+        print("FFT write error: {}".format(e))
+
+
+def handle_fft_param(cmd, filepath):
+    """
+    Write FFT parameter value to file.
+    Format: "FFT_XXX:value" → writes "value" to file
+    """
+    try:
+        val = cmd.split(":")[1]
+        with open(filepath, "w") as f:
+            f.write(val)
+    except Exception as e:
+        print("FFT param write error: {}".format(e))
+
+
+# =============================================================================
+# ENVELOPE SYNC (Pi → Teensy)
+# =============================================================================
+
+def monitor_env_update():
+    """
+    Monitor /dev/shm/fft_env_update for changes and send to Teensy.
+
+    When an audio patch loads in autowaaave, it writes the envelope values
+    to fft_env_update. This thread watches for changes and sends them
+    to the Teensy so its display and internal state stay in sync.
+
+    Format: "smooth,attack,decay,bdecay,hit,slide" (all 0-127)
+    Sends to Teensy as: ENV:smooth,attack,decay,bdecay,hit,slide
+    """
+    last_content = ""
+
+    while True:
+        try:
+            if os.path.exists(FFT_ENV_UPDATE):
+                with open(FFT_ENV_UPDATE, "r") as f:
+                    content = f.read().strip()
+
+                # Only send if content changed
+                if content and content != last_content:
+                    last_content = content
+                    # Send as single ENV: command (Teensy expects this format)
+                    cmd = "ENV:{}".format(content)
+                    ser.write((cmd + '\n').encode())
+                    print("Env sync: {}".format(cmd))
+        except Exception as e:
+            pass  # Silently ignore errors (file might not exist yet)
+
+        time.sleep(0.1)  # Check 10 times per second
+
+# =============================================================================
+# PROCESS DETECTION
+# =============================================================================
+
+APP_PROCESS_NAMES = ('pi_5_stable_04', 'pi_5_stable_03', 'AUTO_WAAAVE_4_5')
+
+
+def wait_and_signal_ready():
+    """
+    Wait for the active AUTO_WAAAVE build to start, then signal Teensy.
+
+    Runs in background thread. Polls for the openFrameworks app
+    process. Once detected, waits 5 seconds for initialization,
+    then sends START command to Teensy.
+
+    The START command tells the Teensy that the video system is
+    ready, enabling its control outputs.
+    """
+    print("Waiting for AUTO_WAAAVE to start...")
+
+    while True:
+        try:
+            # Support the active Pi 5 build and older rollback binaries.
+            running_name = next((name for name in APP_PROCESS_NAMES
+                                 if subprocess.run(['pgrep', '-x', name],
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL).returncode == 0), None)
+
+            if running_name:
+                print("{} detected, waiting for init...".format(running_name))
+                time.sleep(5)  # Wait for app to initialize
+
+                print("Signaling Teensy START...")
+                ser.write(b'START\n')
+                ser.flush()
+                sync_luma_track()
+                return  # Done - exit thread
+
+        except Exception as e:
+            print("Ready check error: {}".format(e))
+
+        time.sleep(1)  # Poll every second
+
+# =============================================================================
+# MAIN
+# =============================================================================
+
+# Connect to Teensy serial port
+ser = get_serial()
+
+# Start background threads
+threading.Thread(target=wait_and_signal_ready, daemon=True).start()
+threading.Thread(target=listen_for_reboot, daemon=True).start()
+threading.Thread(target=udp_to_serial, daemon=True).start()
+threading.Thread(target=monitor_env_update, daemon=True).start()
+
+# Run serial→UDP forwarding in main thread (blocks forever)
+serial_to_pi2()

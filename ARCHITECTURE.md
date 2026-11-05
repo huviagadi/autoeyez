@@ -1,122 +1,159 @@
-architecture_notes.md
+# AutoEyez architecture
 
-Network / SSH Access
-	•	autowaaave Pi (Pi 3B+): autowaaave.local — user: admin, password: admin
-	•	autoclip Pi (Pi 5): autoclip.local / 10.0.0.2 — user: admin, password: admin
-	•	SSH key auth configured from Mac (no password needed for SSH)
-	•	NOPASSWD sudo enabled for admin user on autowaaave Pi
+Source review: 2026-11-05.
 
-Video Streaming (autoclip → autowaaave)
-	•	Low-latency mode: MJPEG over UDP (was H.264/MPEG-TS/TCP)
-	•	Sender (autoclip): mixer.py → ffmpeg mjpeg → udp://10.0.0.1:1236
-	•	Receiver (autowaaave): stream_receive.service → ffmpeg → /dev/video10 (v4l2loopback)
-	•	Backup of original receiver: /etc/systemd/system/stream_receive.service.bak
+## Evidence and status
 
-Deployment (autowaaave)
-	•	Script: ./deploy_autowaaave.sh — copies ofApp.cpp, builds, restarts service
-	•	Manual: scp file to /tmp, then ssh to copy/build/restart
-	•	DO NOT use: sshpass (not installed), expect with sudo (password prompts break)
-	•	Build command: cd /home/pi/openFrameworks/apps/myApps/AUTO_WAAAVE_4_5 && sudo make -j4
-	•	Restart: sudo systemctl restart autowaaave
+This map comes from firmware, application source, shaders, and service files in
+this repository. Older notes, plans, and READMEs were not used to establish
+the architecture. The tree holds multiple generations and staged copies.
+The code shows what each variant does; it does not prove what is installed or
+running on either Pi. Live device state was not checked for this revision.
 
-Hardware Platform
-	•	Teensy 4.1 running at 600MHz with 1MB RAM and 8MB flash
-	•	PJRC Audio Shield Rev D stacked on Teensy header pins
-	•	VUSB trace intentionally cut — Teensy powered via external 5V on VIN pin, USB used only for MIDI data
-	•	AMS1117-3.3 voltage regulator powered from VUSB (5V), supplies 3.3V rail to all OLEDs and shift registers independently of Teensy onboard regulator (which failed once from overload)
-	•	Bootloader access requires: power on via 5V rail first, then connect USB data cable while holding program button for ~20 seconds until dim flickering LED appears
-Display System
-	•	9x SH1106 OLED displays driven with Adafruit SSD1306 library (controllers are SH1106 not SSD1306 despite vendor listing)
-	•	All displays share SPI bus: SCK pin 13, MOSI pin 11, DC pin 15, RES pin 29
-	•	Individual CS pins: display 0-6 on pins 0-6, display 7 on pin 9, display 8 on pin 14
-	•	33Ω series resistors on SCK, MOSI and DC lines for signal integrity — critical, removing them causes display jitter
-	•	104 ceramic decoupling capacitors on each display VCC to GND
-	•	RES line previously caused issues when shared — now managed manually with pinMode/digitalWrite before begin()
-	•	Adafruit SSD1306 begin() call: displays[i].begin(SSD1306_SWITCHCAPVCC, 0, false, true) — third param false prevents library touching RES, fourth param true initializes SPI
-	•	Garbage pixels appear on right edge of displays (SH1106 has 132 column RAM, display shows 128) — partially mitigated with signal line capacitors
-	•	Display objects declared as global array of 9 Adafruit_SSD1306 instances
-	•	Each display() call transfers full 1KB frame buffer over SPI taking ~1300µs
-	•	Critical: maximum one display update per loop iteration to prevent audio interrupt starvation
-	•	All display calls wrapped in AudioNoInterrupts/AudioInterrupts
-	•	Dirty flag system: arrays labelUpdated[9] and graphUpdated[8] track which screens need redrawing
-	•	On page change all dirty flags set to false triggering full redraw over subsequent loop iterations
-	•	Normal loop time: ~345µs, with one display update: ~1600µs, must stay under 2900µs
-Audio System
-	•	SGTL5000 codec on audio shield handles line in via solderable pads on shield PCB
-	•	AudioAnalyzeFFT256 provides 128 frequency bins at 44100Hz sample rate = 172Hz per bin
-	•	FFT display uses first 32-64 bins covering ~5.5-11kHz musical range
-	•	Fast attack/slow decay smoothing applied to FFT bins for visual feel
-	•	AudioMemory set to 16 — higher values needed to survive occasional 2800µs loop spikes
-	•	Spectrum drawn on display 8 (screen 9) only on page 0
-	•	AudioControlSGTL5000 global object declaration order matters — must come after display array declaration or Teensy hangs on boot
-	•	Known instability: page changes can crash system due to audio interrupt starvation during burst of display updates — staggered update system partially mitigates this
-Button System
-	•	Two 74HC165 input shift registers daisy chained
-	•	Chip 1 handles: standalone buttons 1-3 (bits 0-2), encoder SW 1-5 (bits 3-7)
-	•	Chip 2 handles: encoder SW 6-9 (bits 8-11), unused inputs tied to 3.3V (bits 12-15)
-	•	10kΩ pullup resistors required on all 12 active inputs — 74HC165 has no internal pullups, floating inputs cause erratic behavior
-	•	Button reading uses bitwise edge detection: pressed, released, held, notPressed
-	•	Debounce implemented in software with 5ms stability window
-	•	Data flows: Chip1 QH (pin9) → Chip2 SER (pin10) → Chip2 QH (pin9) → Teensy pin 26
-	•	Button bit order confirmed empirically — standalone buttons bits 0-2, encoders bits 3-11
-	•	74HC165 chips are fragile — one failed during development from likely static discharge or voltage spike. Series resistors on inputs recommended for future protection
-	•	Mask 0x0FFF applied to button reads to ignore unused upper bits
-LED System
-	•	74HC595 output shift register on pins 22 (data), 24 (clk), 25 (latch)
-	•	LED physical to bit mapping (confirmed empirically):
-	◦	Bit 0 = Button LED 1
-	◦	Bit 1 = Button LED 2
-	◦	Bit 2 = Button LED 3
-	◦	Bit 3 = Standalone LED 1
-	◦	Bit 4 = Standalone LED 2
-	◦	Bit 5 = Standalone LED 3
-	◦	Bit 6 = Standalone LED 4
-	◦	Bit 7 = Standalone LED 5
-	•	Standalone button LEDs are 5-12V rated with internal current limiting — driven directly from 3.3V shift register output, light dimly but acceptably
-	•	Power-on reset: shift register outputs float before Teensy initializes causing LEDs to flicker — mitigated by immediately shifting 0x00 as first setup() action
-	•	LED states managed via bool LED_ON[8] array, converted to byte and shifted out each loop
-Encoder System
-	•	9x rotary encoders with push button on pins 30-47 (CLK/DT pairs)
-	•	Encoder library by Paul Stoffregen used for reliable pulse counting
-	•	Encoders accessed via pointer array: Encoder* encoders[9] = {&enc0, &enc1, ...}
-	•	Direction inverted from default — increment uses -1 : 1 not 1 : -1
-	•	encoder_speed multiplier applied to value changes for faster response
-	•	Values constrained to 0-127 for MIDI CC compatibility
-	•	function_value[16] stores current value for all 16 parameters across both pages
-	•	function_reset[16] stores default reset values, applied via memcpy on reset button
-MIDI System
-	•	USB MIDI via Teensy native USB — set Tools → USB Type → MIDI or Serial+MIDI
-	•	Teensy appears as standard USB MIDI device, no drivers needed on Mac/Linux
-	•	sendControlChange(ccNumber, value, channel) for encoder values
-	•	sendNoteOn/sendNoteOff for function button state changes
-	•	usbMIDI.send_now() called after every message
-	•	cc_encoder[16] array maps encoder index to CC number
-	•	cc_control[8] array maps control button index to CC number
-	•	cc_reactive[3] array for reactive/standalone button CCs
-	•	MIDI channel 1 used throughout
-	•	Known bug: patch loading updates UI values but does not send MIDI CC messages to auto_waaave — values display correctly on screens but auto_waaave parameters are not updated
-Page System
-	•	bool page toggles between 0 and 1 on BTN_MENU release
-	•	Page 0: label[] array, parameters 0-7, encoders map to function_value[0-7]
-	•	Page 1: label_B[] array, parameters 8-15, encoders map to function_value[8-15]
-	•	Parameter index formula: temp_function = (8 * page) + encoder_index
-	•	Control buttons: 4 per page, index formula temp_control = (4 * page) + i
-	•	Function buttons: 4 per page cycling through 4 states (0-3), index formula temp_function = (4 * page) + i
-	•	LED_ON[LED_5] indicates current page state
-	•	Page change sets all dirty flags for full screen redraw
-Known Issues and Gotchas
-	•	Audio crashes on rapid page changes — audio interrupt starvation from burst display updates
-	•	SH1106 garbage pixels on right edge of all displays
-	•	Patch load doesn't apply values to auto_waaave via MIDI
-	•	Teensy bootloader access is non-trivial due to cut VUSB trace — requires specific power-on sequence
-	•	Two copies of Encoder library found during development — keep only Teensy packages version
-	•	AudioControlSGTL5000 global declaration order sensitive — crashes if declared before display array
-	•	74HC165 inputs must have external pullups — no internal pullups on this chip
-	•	SPI signal resistors are critical — do not remove
-	•	Power budget: OLEDs + shift registers + LEDs draw ~265mA, AMS1117 handles this comfortably at 1A rating
-Development Environment
-	•	Arduino IDE 2.3.8
-	•	Teensyduino 1.60
-	•	Libraries: Adafruit SSD1306, Adafruit GFX, Encoder (Teensy packages version), Teensy Audio
-	•	Upload via Teensy Loader for reliable bootloader access
-	•	Serial monitor at 115200 baud for debugging
+## Signal flow
+
+```text
+Composite capture ─┐
+MP4 clips ──────────┼─> autoclip mixer ── TCP video ──> autowaaave receiver
+Generated sources ──┘      │                             │
+                           │                       /tmp/video_shm
+                           │                             │
+Akai Force ── USB MIDI ─────┤                     openFrameworks GPU
+                           │                      feedback and effects
+                           │                             │
+                           └─ UDP CC offsets ────────────┤──> HDMI
+
+Teensy ── USB MIDI: parameters and FFT ───────────────────┘
+Teensy ⇄ USB serial ⇄ video_bridge.py ⇄ UDP ⇄ autoclip
+Audio line in ──> Teensy Audio Shield; HiFiBerry supports Pi FFT/HDMI loop
+```
+
+Software targets autoclip at `10.0.0.2` and autowaaave at `10.0.0.1`.
+The Teensy connects to autowaaave, not directly to autoclip.
+
+## Hardware and controller firmware
+
+The `automidi/auto_midi_v0911/` firmware targets a Teensy 4.1. It declares
+nine quadrature encoders on pins 30–47, nine 128×64 SPI OLED objects with
+chip selects on pins 0–6, 9, and 14, twelve button bits read through 74HC165
+registers, and eight LED outputs through a 74HC595. It initializes the
+Teensy's SD card at CS 10. The source identifies SH1106 display hardware even
+though it uses `Adafruit_SSD1306` objects.
+
+The PJRC Audio Shield's SGTL5000 line input feeds `AudioAnalyzeFFT256`.
+The firmware also has left/right I2S monitor paths. It derives low, mid,
+and high bands and sends them as USB MIDI CC 110–112 plus a completed-frame
+marker on CC 113; CC 114–119 carry extended band values. In this source,
+`FFT_SERIAL_COMPAT` is zero. USB serial carries commands and returned state.
+The controller has three pages for renderer, playback, mixer, patch, and
+processing controls. The firmware source names 26 selectable video sources.
+
+Video and audio patches are distinct. The current firmware code bounds each
+patch cursor to 32 slots and uses `PATCHnn.TXT` and `AUDIOnn.TXT` on SD.
+It implements a serial `PTX` exchange, patch validation, and recovery of
+interrupted saves. Its clip-list buffer holds up to 64 names; this is separate
+from the patch-slot count. Sources: `auto_midi_v0911.ino`,
+`video_patch_schema.h`, `safe_patch_store.h`, and `patch_journal.h`.
+
+## Source and mixer Pi: autoclip
+
+`autoclip/mixer.py` composes 720×576 RGB frames. Its inputs are the
+`video_player.py` clip player, three composite USB capture devices, an
+optional external USB capture device, and generated sources. Capture is
+decoded by FFmpeg workers addressed through stable `/dev/v4l/by-path/`
+names. Workers run when their source is selected and retry after failure.
+`math_sources.py`, `gpu_shader_sources.py`, and shader files implement
+generated inputs.
+The controller menu has 26 source entries, while this root `mixer.py` defines
+and dispatches only indices 0–15. The extra entries are not supported by this
+root mixer file. A different deployed mixer may supply them; that has not
+been verified here.
+
+`video_player.py` uses PyAV for MP4 decode. It reads `/home/admin/clips/`
+and prefers a matching `/home/admin/clips_seek/` copy when present. It
+handles clip selection, play/pause, position seek, and two stutter lanes.
+The mixer applies an equal-power A/B crossfade and optional third-source
+luma key with low and high thresholds. It also writes a local preview to
+`/dev/fb0`.
+
+`autoclip/video_control.py` receives text commands on UDP 5006, passes
+playback and mixer settings through local IPC, and returns clip/mixer state
+on UDP 5005. The mixer reads `/tmp/mixer_cmd.json` and publishes
+`/tmp/mixer_state.json`; the player also has a Unix datagram socket for
+direct cue, seek, and stutter control.
+
+`setup_midi_gadget.sh` configures the Pi USB MIDI gadget.
+`force_cc_forward.py` reads the Akai Force MIDI input, sends selected CCs
+to autowaaave on UDP 5010, and sends clip cue/seek/stutter commands to the
+local player. `side_keypad.py` handles cue and shader-source control, but
+its `patch_transport` and `shader_controls` imports are absent from the
+`autoclip/` root in this checkout; staged copies exist elsewhere. Its
+deployed module set must be inspected before describing that runtime exactly.
+
+## Video transport
+
+Both implemented routes produce RGB 720×480 frames for the renderer through
+the GStreamer shared-memory socket `/tmp/video_shm`.
+
+| Route | Sender | Receiver | Evidence |
+| --- | --- | --- | --- |
+| Raw | FFmpeg scales the mix to 720×480 I420/YUV420p and sends TCP 1237 | `rawvideoparse` → RGB → `shmsink` | `autoclip/mixer.py`, `autoclip/video.service`, `Codex Port/v04/stream_receive_shm.service` |
+| Codec damage | `mixer_codec_intra_refresh.py` encodes Annex B H.264 with AUD and intra refresh to TCP 1238 | `realtime_codec_damage.py` forwards to local TCP 1239; H.264 decoder → RGB → `shmsink` | `codec_mosh_trial_20261104/` scripts and service overrides |
+
+The codec proxy can remove H.264 slices before decode. It reads Teensy FFT
+MIDI and controls in `/dev/shm/codec_damage`. This is separate from the
+renderer GPU motion-smear effect. The root `video.service` selects raw
+TCP 1237; the codec route needs different scripts and service overrides.
+The repository alone cannot establish which route is currently active.
+
+## Renderer Pi: autowaaave
+
+The Pi 5 renderer source in `Codex Port/v04/ofApp.cpp` reads the incoming
+frame with `ofVideoGrabber`. A newer staged renderer at
+`autowaaave/peek_menu_fix_20261026/ofApp.cpp` retains a 720×480 input,
+1920×1080 canvas, and 30-frame `pastFrames` FBO ring. The main mixer
+shader combines the incoming image and selected history frames for feedback,
+luma key, geometric displacement, color changes, mirror/wrap, and temporal
+filtering. Later FBO passes apply sharpening, pixelation, chromatic
+aberration, color crush, and motion smear. Staged renderer code adds further
+input, hold, and Peek processing. The resulting image goes to HDMI and back
+into the history ring.
+
+The renderer takes Teensy MIDI parameters directly and listens for the Force
+offset layer on UDP 5010. Audio-band assignments modulate parameters. Pi 5
+renderer variants consume complete Teensy FFT MIDI frames; older serial
+FFT-file support remains in the source tree.
+
+`autowaaave/video_bridge.py` opens Teensy USB serial at
+`/dev/ttyACM0`, 115200 baud. It forwards ordinary lines to autoclip UDP
+5006 and returns autoclip UDP 5005 state to the controller. It handles local
+FFT/envelope and audio-pass commands, sends `START` after detecting the
+renderer process, and listens on UDP 5007 for a Teensy reboot request.
+`alsaloop.service` can route shared HiFiBerry capture to HDMI audio;
+`hdmi_audio.py` toggles it from controller commands.
+
+## Processes and deployment boundary
+
+| Host | Repository unit or script | Responsibility |
+| --- | --- | --- |
+| autoclip | `video.service` → `mixer.py` | Player, capture, mix, preview, stream |
+| autoclip | `video_control.py` | UDP control/state and local IPC |
+| autoclip | `midi-gadget.service`, `force_cc_forward.service` | Force USB MIDI |
+| autoclip | `side-keypad.service` | Cue and shader-source controls; root imports incomplete |
+| autowaaave | `stream_receive_shm.service` variant | TCP receiver and shared memory |
+| autowaaave | Pi 5 `autowaaave.service` variant | openFrameworks renderer |
+| autowaaave | `video_bridge.service` | Teensy serial ↔ autoclip UDP |
+| autowaaave | optional `codec_damage.service` | Compressed-stream damage proxy |
+| autowaaave | `alsaloop.service`, `hdmi_volume_cc.service` | Optional HDMI audio copy and Force volume |
+
+Root renderer files and some root units describe earlier arrangements;
+Pi 5 units and newer source are also in `Codex Port/`, `pi5_port/`,
+and dated staging directories. A file's presence here does not mean that
+unit is enabled or that the same source is installed on a Pi.
+
+## Update procedure
+
+For future revisions, compare this map with the deployed scripts and binary,
+firmware hash, `systemctl cat` output, active services, and selected
+stream port. Record observed device state and date separately from source
+variants. Update claims only from inspected code or device observations.

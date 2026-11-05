@@ -1,0 +1,13 @@
+[Unit]
+Description=Recover stalled autoclip USB MIDI gadget
+After=force_cc_forward.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/admin/midi_gadget_watchdog.py
+Restart=always
+RestartSec=3
+User=root
+
+[Install]
+WantedBy=multi-user.target

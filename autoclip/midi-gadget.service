@@ -1,0 +1,13 @@
+[Unit]
+Description=Autoeyez full-speed USB MIDI gadget
+After=sys-kernel-config.mount
+Before=force_cc_forward.service
+Wants=sys-kernel-config.mount
+
+[Service]
+Type=oneshot
+ExecStart=/home/admin/setup_midi_gadget.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -80,6 +80,7 @@
 #include "ofApp.h"
 
 #include "iostream"
+#include <sys/stat.h>
 
 // =============================================================================
 // CONSTANTS
@@ -153,6 +154,10 @@ float hn = 1;     // Brightness attenuation
 float jm = 0.0;   // Feedback mix amount
 float kk = 0.0;   // Luma key threshold
 float ll = 0.0;   // Sharpen amount
+float moshAmount = 0.0;   // Mosh effect (CC 94) - 0=off, 1=full
+float chromaAmount = 0.0; // Chromatic aberration (CC 95)
+float crushAmount = 0.0;  // Bit crush (CC 96)
+float pixelAmount = 0.0;  // Pixelize (CC 97)
 float qw = 0.0;   // Rotation
 float er = 1.0;   // Hue modulo
 float ty = 0.0;   // Hue offset
@@ -161,14 +166,14 @@ float op = 0.0;   // Temporal filter mix
 
 float fb1_brightx=0.0;
 bool toroidSwitch=0;
-bool y_skew_switch=FALSE;
-bool x_skew_switch=FALSE;
-bool lumakeyInvertSwitch=FALSE;
-bool x_mirrorSwitch=FALSE;
-bool y_mirrorSwitch=FALSE;
+bool y_skew_switch=false;
+bool x_skew_switch=false;
+bool lumakeyInvertSwitch=false;
+bool x_mirrorSwitch=false;
+bool y_mirrorSwitch=false;
 float y_skew=0;
 float x_skew=0;
-bool mirrorSwitch=FALSE;
+bool mirrorSwitch=false;
 
 int fb0_delayamount=0;
 
@@ -243,46 +248,46 @@ float highC16=0.0;
 
 bool clear_switch=0;
 //toggle switch variables
-bool hueInvert=FALSE;
-bool saturationInvert=FALSE;
-bool brightInvert=FALSE;
+bool hueInvert=false;
+bool saturationInvert=false;
+bool brightInvert=false;
 
-bool cam1_h_invert=FALSE;
-bool cam1_s_invert=FALSE;
-bool cam1_b_invert=FALSE;
+bool cam1_h_invert=false;
+bool cam1_s_invert=false;
+bool cam1_b_invert=false;
 
-bool horizontalMirror=FALSE;
-bool verticalMirror=FALSE;
+bool horizontalMirror=false;
+bool verticalMirror=false;
 
-bool clear_flip=FALSE;
+bool clear_flip=false;
 
-bool x_2=FALSE;
-bool x_5=FALSE;
-bool x_10=FALSE;
+bool x_2=false;
+bool x_5=false;
+bool x_10=false;
 
-bool y_2=FALSE;
-bool y_5=FALSE;
-bool y_10=FALSE;
+bool y_2=false;
+bool y_5=false;
+bool y_10=false;
 
-bool z_2=FALSE;
-bool z_5=FALSE;
-bool z_10=FALSE;
+bool z_2=false;
+bool z_5=false;
+bool z_10=false;
 
-bool r_2=FALSE;
-bool r_5=FALSE;
-bool r_10=FALSE;
+bool r_2=false;
+bool r_5=false;
+bool r_10=false;
 
-bool huexx_0=FALSE;
-bool huexx_1=FALSE;
-bool huexx_2=FALSE;
+bool huexx_0=false;
+bool huexx_1=false;
+bool huexx_2=false;
 
-bool huexy_0=FALSE;
-bool huexy_1=FALSE;
-bool huexy_2=FALSE;
+bool huexy_0=false;
+bool huexy_1=false;
+bool huexy_2=false;
 
-bool huexz_0=FALSE;
-bool huexz_1=FALSE;
-bool huexz_2=FALSE;
+bool huexz_0=false;
+bool huexz_1=false;
+bool huexz_2=false;
 
 //framebuffer management biziness
 
@@ -349,7 +354,7 @@ float smoothing_rate=.5;
 ofFbo aspect_fix_fbo;
 ofFbo dry_framebuffer;
 
-bool videoReactiveSwitch=FALSE;
+bool videoReactiveSwitch=false;
 
 float vLumakeyValue=0.0;
 float vMix=0.0;
@@ -413,19 +418,28 @@ float d_huex_lfo;
 // SETUP — Application initialization
 // =============================================================================
 void ofApp::setup() {
+    // Log GL version to verify GLES2 context
+    ofLogNotice() << "GL_VERSION: " << glGetString(GL_VERSION);
+    ofLogNotice() << "GL_RENDERER: " << glGetString(GL_RENDERER);
+    ofLogNotice() << "GLSL_VERSION: " << glGetString(GL_SHADING_LANGUAGE_VERSION);
+
     // Target 30fps (matches automidi's p-lock timing)
     ofSetFrameRate(30);
     ofBackground(0);
     ofHideCursor();  // No cursor for video output display
 
     // Initialize subsystems
-    inputSetup();           // Video input (TCP stream from autoclip)
+    // inputSetup() deferred until video socket ready (see update())
     midiSetup();            // USB MIDI from automidi Teensy
     fbDeclareAndAllocate(); // Framebuffer objects for delay/feedback
 
     // Load GPU shaders
     shader_mixer.load("shadersES2/shader_mixer");    // Main video processing
     shaderSharpen.load("shadersES2/shaderSharpen");  // Sharpen post-process
+    shaderPixel.load("shadersES2/shaderPixel");      // Pixelize effect
+    shaderChroma.load("shadersES2/shaderChroma");    // Chromatic aberration
+    shaderCrush.load("shadersES2/shaderCrush");      // Bit crush
+    shaderMosh.load("shadersES2/shaderMosh");        // Datamosh
 
     // FFT audio analysis (HiFiBerry line-in)
     fft.setup();
@@ -459,8 +473,35 @@ void ofApp::update() {
         }
     }
 
+    // Video initialization: wait for socket, then init grabber
+    if(!videoInitialized && checkSocketExists()) {
+        inputSetup();
+        videoInitialized = true;
+        lastFrameTime = ofGetElapsedTimeMillis();
+    }
+
+    // Video update and readiness check
+    if(videoInitialized) {
+        inputUpdate();
+        if(cam1.isFrameNew()) {
+            lastFrameTime = ofGetElapsedTimeMillis();
+            videoReady = true;
+        } else if(videoReady && (ofGetElapsedTimeMillis() - lastFrameTime > 1000)) {
+            // No frame for 1 second - show loading (handles mid-show drops)
+            videoReady = false;
+        }
+    }
+
+    // Loading animation
+    if(!videoReady) {
+        unsigned long now = ofGetElapsedTimeMillis();
+        if(now - lastDotUpdate > 400) {
+            loadingDotState = (loadingDotState + 1) % 4;
+            lastDotUpdate = now;
+        }
+    }
+
     fft.update();
-    inputUpdate();
     midibiz();
     p_lockUpdate();
     
@@ -471,33 +512,52 @@ void ofApp::update() {
 
 //--------------------------------------------------------------
 void ofApp::draw() {
-    
-    
+
+    // Show loading screen until video is ready
+    if(!videoReady) {
+        drawLoading();
+        return;
+    }
+
     //the range changes depending on what yr using for sound input.  just usb cams have shitter ranges
     //so 50 works
     //float range=200;
-    
+
     fftAssignValues();
-    
+
     parametersAssign();
-    
+
+    // DEBUG: log shader uniform values and locations
+    static int debugCounter = 0;
+    static bool checkedLocations = false;
+    if(!checkedLocations) {
+        GLint locTex0 = glGetUniformLocation(shader_mixer.getProgram(), "tex0");
+        GLint locFb = glGetUniformLocation(shader_mixer.getProgram(), "fb");
+        GLint locTempFilter = glGetUniformLocation(shader_mixer.getProgram(), "temporalFilter");
+        GLint locZ = glGetUniformLocation(shader_mixer.getProgram(), "fbZDisplace");
+        GLint locMix = glGetUniformLocation(shader_mixer.getProgram(), "fbMix");
+        ofLogNotice() << "UNIFORM LOCATIONS: tex0=" << locTex0 << " fb=" << locFb
+                      << " temporalFilter=" << locTempFilter
+                      << " fbZDisplace=" << locZ << " fbMix=" << locMix
+                      << " (-1 means NOT FOUND)";
+        checkedLocations = true;
+    }
+    if(++debugCounter % 60 == 0) {
+        ofLogNotice() << "d_z=" << d_z << " d_x=" << d_x << " d_y=" << d_y
+                      << " d_rotate=" << d_rotate << " d_mix=" << d_mix
+                      << " d_hue=" << d_hue << " d_sat=" << d_sat;
+    }
+
     framebuffer0.begin();
     shader_mixer.begin();
-    
-    
-    //videoGrabber.getTextureReference().draw(0, 0, 320, 640);
+
+    // Draw first (ftransform style binds texture via draw)
     if(scaleswitch==0){
-        if(inputswitch==0){
-            //videoGrabber.draw(0,0,320,240);
-        }
         if(inputswitch==1){
             cam1.draw(0,0,320,240);
         }
     }
     if(scaleswitch==1){
-        if(inputswitch==0){
-            //videoGrabber.draw(0,0);
-        }
         if(inputswitch==1){
             if(hdmi_aspect_ratio_switch==0){
                 cam1.draw(0,0,width,height);
@@ -507,51 +567,8 @@ void ofApp::draw() {
             }
         }
     }
-    /*
-     //textures
-     shader_mixer.setUniformTexture("fb0", pastFrames[d_delay].getTexture(),1);
-     
-     if(wet_dry_switch==1){
-     shader_mixer.setUniformTexture("fb1", pastFrames[(abs(framedelayoffset-framebufferLength)-1)%framebufferLength].getTexture(),2);
-     }
-     if(wet_dry_switch==0){
-     shader_mixer.setUniformTexture("fb1", dry_framebuffer.getTexture(),2);
-     }
-     //continuous variables
-     shader_mixer.setUniform1f("fb0_lumakey_value",d_lumakey_value);
-     shader_mixer.setUniform1f("fb0_mix",d_mix);
-     shader_mixer.setUniform3f("fb0_hsbx",ofVec3f(d_hue,d_sat,d_bright));
-     shader_mixer.setUniform1f("temporalFilterMix",d_temporalFilterMix);
-     shader_mixer.setUniform1f("fb1_brightx",d_temporalFilterResonance );
-     shader_mixer.setUniform1f("cam1_brightx",d_cam1_x);
-     shader_mixer.setUniform1f("fb0_xdisplace",d_x);
-     shader_mixer.setUniform1f("fb0_ydisplace",d_y);
-     shader_mixer.setUniform1f("fb0_zdisplace",d_z);
-     shader_mixer.setUniform1f("fb0_rotate",d_rotate);
-     shader_mixer.setUniform3f("fb0_huex",ofVec3f(d_huex_mod,d_huex_off,d_huex_lfo));
-     
-     if(wet_dry_switch==1){
-     shader_mixer.setUniform1i("toroidSwitch",toroidSwitch);
-     shader_mixer.setUniform1i("mirrorSwitch",0);
-     }
-     
-     if(wet_dry_switch==0){
-     shader_mixer.setUniform1i("toroidSwitch",0);
-     shader_mixer.setUniform1i("mirrorSwitch",toroidSwitch);
-     }
-     
-     
-     shader_mixer.setUniform1i("brightInvert",brightInvert);
-     shader_mixer.setUniform1i("hueInvert",hueInvert);
-     shader_mixer.setUniform1i("saturationInvert",saturationInvert);
-     
-     shader_mixer.setUniform1i("horizontalMirror",horizontalMirror);
-     shader_mixer.setUniform1i("verticalMirror",verticalMirror);
-     
-     
-     shader_mixer.setUniform1i("lumakeyInvertSwitch",lumakeyInvertSwitch);
-     */
-    //send the textures
+
+    // Send textures
     shader_mixer.setUniformTexture("fb", pastFrames[d_delay].getTexture(),1);
     if(wet_dry_switch==1){
         shader_mixer.setUniformTexture("temporalFilter", pastFrames[(abs(framedelayoffset-framebufferLength)-1)%framebufferLength].getTexture(),2);
@@ -559,7 +576,7 @@ void ofApp::draw() {
     if(wet_dry_switch==0){
         shader_mixer.setUniformTexture("temporalFilter", dry_framebuffer.getTexture(),2);
     }
-    //send the continuous variables
+    // Send continuous variables
     shader_mixer.setUniform1f("lumakey",d_lumakey_value);
     shader_mixer.setUniform1f("fbMix",d_mix);
     shader_mixer.setUniform1f("fbHue",d_hue);
@@ -575,8 +592,7 @@ void ofApp::draw() {
     shader_mixer.setUniform1f("fbHuexMod",d_huex_mod);
     shader_mixer.setUniform1f("fbHuexOff",d_huex_off);
     shader_mixer.setUniform1f("fbHuexLfo",d_huex_lfo);
-    
-    //send the switches
+    // Send switches
     shader_mixer.setUniform1i("toroidSwitch",toroidSwitch);
     shader_mixer.setUniform1i("mirrorSwitch",mirrorSwitch);
     shader_mixer.setUniform1i("brightInvert",brightInvert);
@@ -585,8 +601,7 @@ void ofApp::draw() {
     shader_mixer.setUniform1i("horizontalMirror",horizontalMirror);
     shader_mixer.setUniform1i("verticalMirror",verticalMirror);
     shader_mixer.setUniform1i("lumakeyInvertSwitch",lumakeyInvertSwitch);
-    
-    //send the videoreactive controls
+    // Send videoreactive controls
     shader_mixer.setUniform1f("vLumakey",vLumakeyValue*c_lumakey_value);
     shader_mixer.setUniform1f("vMix",vMix*c_mix);
     shader_mixer.setUniform1f("vHue",2.0f*vHue*c_hue);
@@ -618,6 +633,7 @@ void ofApp::draw() {
         sharpenFramebuffer.end();
     }
 
+    // Draw output
     outputFbo.draw(0,0,ofGetWidth(),ofGetHeight());
 
     blackoutSmoothed += (blackoutAmount - blackoutSmoothed) * 0.08f;
@@ -643,14 +659,12 @@ void ofApp::draw() {
         }
 
         dry_framebuffer.begin();
-        //framebuffer0.draw(0,0);
         outputFbo.draw(0,0);
         dry_framebuffer.end();
 
     }//endifwetdry0
 
     if(wet_dry_switch==1){
-        //framebuffer0.draw(0,0);
         outputFbo.draw(0,0);
     }//endifwetdry1
     
@@ -965,20 +979,28 @@ void ofApp::p_lockClear(){
 //------------------------------------------------------------
 void ofApp::midiSetup(){
     // print input ports to console
+    ofLogNotice() << "MIDI: listing ports...";
     midiIn.listInPorts();
-    
+    ofLogNotice() << "MIDI: " << midiIn.getNumInPorts() << " ports available";
+
     // open port by number (you may need to change this)
-    midiIn.openPort(1);
-    //midiIn.openPort("IAC Pure Data In");	// by name
-    //midiIn.openVirtualPort("ofxMidiIn Input"); // open a virtual port
-    
+    if(midiIn.getNumInPorts() > 1) {
+        midiIn.openPort(1);
+        ofLogNotice() << "MIDI: opened port 1, isOpen=" << midiIn.isOpen();
+    } else if(midiIn.getNumInPorts() > 0) {
+        midiIn.openPort(0);
+        ofLogNotice() << "MIDI: opened port 0, isOpen=" << midiIn.isOpen();
+    } else {
+        ofLogWarning() << "MIDI: NO PORTS AVAILABLE!";
+    }
+
     // don't ignore sysex, timing, & active sense messages,
     // these are ignored by default
     midiIn.ignoreTypes(false, false, false);
-    
+
     // add ofApp as a listener
     midiIn.addListener(this);
-    
+
     // print received messages to the console
     midiIn.setVerbose(true);
 }
@@ -1003,13 +1025,57 @@ void ofApp::fbDeclareAndAllocate(){
     sharpenFramebuffer.begin();
     ofClear(0,0,0,255);
     sharpenFramebuffer.end();
-    
+
+    // Mosh effect FBOs (ping-pong accumulator)
+    for(int i=0; i<2; i++){
+        moshAccum[i].allocate(width,height);
+        moshAccum[i].begin();
+        ofClear(0,0,0,255);
+        moshAccum[i].end();
+    }
+    moshPrevFrame.allocate(width,height);
+    moshPrevFrame.begin();
+    ofClear(0,0,0,255);
+    moshPrevFrame.end();
+
     for(int i=0;i<framebufferLength;i++){
         pastFrames[i].allocate(width, height);
         pastFrames[i].begin();
         ofClear(0,0,0,255);
         pastFrames[i].end();
     }
+}
+//-------------------------------------------------------------
+bool ofApp::checkSocketExists() {
+    const char* socketPath = getenv("SHMSRC_PATH");
+    if(socketPath == NULL) socketPath = "/tmp/video_shm";
+    struct stat sb;
+    return (stat(socketPath, &sb) == 0);
+}
+//-------------------------------------------------------------
+void ofApp::drawLoading() {
+    ofBackground(0);
+
+    // Build loading text with animated dots
+    string dots = "";
+    for(int i = 0; i < loadingDotState; i++) dots += ".";
+    string text = "LOADING" + dots;
+
+    // Scale up for visibility (bitmap font is 8x14 pixels per char)
+    float scale = 5.0;
+    float charWidth = 8;
+    float charHeight = 14;
+
+    // Reserve space for max dots so LOADING doesn't shift
+    float maxWidth = 10 * charWidth * scale;  // "LOADING..."
+    float textHeight = charHeight * scale;
+
+    ofPushMatrix();
+    ofTranslate((ofGetWidth() - maxWidth) / 2, (ofGetHeight() - textHeight) / 2);
+    ofScale(scale, scale);
+    ofSetColor(255);
+    ofDrawBitmapString(text, 0, charHeight);
+    ofPopMatrix();
 }
 //-------------------------------------------------------------
 void ofApp::inputSetup(){
@@ -1206,6 +1272,19 @@ void ofApp::midibiz(){
                 if(message.control==93){
                     loadAudioPatch((int)message.value) ;
                 }
+                // Effect shaders (CC 94-97)
+                if(message.control==94){
+                    moshAmount = message.value / 127.0f;
+                }
+                if(message.control==95){
+                    chromaAmount = message.value / 127.0f;
+                }
+                if(message.control==96){
+                    crushAmount = message.value / 127.0f;
+                }
+                if(message.control==97){
+                    pixelAmount = message.value / 127.0f;
+                }
                 // Safety timeout — auto-disable forceMidiWrite after 2s
                 if(forceMidiWrite && ofGetElapsedTimeMillis() - forceMidiWriteTimer > 2000){
                     forceMidiWrite = false ;
@@ -1266,106 +1345,106 @@ void ofApp::midibiz(){
                     }
                 }
                 if(message.control==32){
-                    if(message.value==127){ x_2=TRUE; }
-                    if(message.value==0){ x_2=FALSE; }
+                    if(message.value==127){ x_2=true; }
+                    if(message.value==0){ x_2=false; }
                 }
                 if(message.control==48){
-                    if(message.value==127){ x_5=TRUE; }
-                    if(message.value==0){ x_5=FALSE; }
+                    if(message.value==127){ x_5=true; }
+                    if(message.value==0){ x_5=false; }
                 }
                 if(message.control==64){
-                    if(message.value==127){ x_10=TRUE; }
-                    if(message.value==0){ x_10=FALSE; }
+                    if(message.value==127){ x_10=true; }
+                    if(message.value==0){ x_10=false; }
                 }
                 if(message.control==33){
-                    if(message.value==127){ y_2=TRUE; }
-                    if(message.value==0){ y_2=FALSE; }
+                    if(message.value==127){ y_2=true; }
+                    if(message.value==0){ y_2=false; }
                 }
                 if(message.control==49){
-                    if(message.value==127){ y_5=TRUE; }
-                    if(message.value==0){ y_5=FALSE; }
+                    if(message.value==127){ y_5=true; }
+                    if(message.value==0){ y_5=false; }
                 }
                 if(message.control==65){
-                    if(message.value==127){ y_10=TRUE; }
-                    if(message.value==0){ y_10=FALSE; }
+                    if(message.value==127){ y_10=true; }
+                    if(message.value==0){ y_10=false; }
                 }
                 if(message.control==34){
-                    if(message.value==127){ z_2=TRUE; }
-                    if(message.value==0){ z_2=FALSE; }
+                    if(message.value==127){ z_2=true; }
+                    if(message.value==0){ z_2=false; }
                 }
                 if(message.control==50){
-                    if(message.value==127){ z_5=TRUE; }
-                    if(message.value==0){ z_5=FALSE; }
+                    if(message.value==127){ z_5=true; }
+                    if(message.value==0){ z_5=false; }
                 }
                 if(message.control==66){
-                    if(message.value==127){ z_10=TRUE; }
-                    if(message.value==0){ z_10=FALSE; }
+                    if(message.value==127){ z_10=true; }
+                    if(message.value==0){ z_10=false; }
                 }
                 if(message.control==35){
-                    if(message.value==127){ r_2=TRUE; }
-                    if(message.value==0){ r_2=FALSE; }
+                    if(message.value==127){ r_2=true; }
+                    if(message.value==0){ r_2=false; }
                 }
                 if(message.control==51){
-                    if(message.value==127){ r_5=TRUE; }
-                    if(message.value==0){ r_5=FALSE; }
+                    if(message.value==127){ r_5=true; }
+                    if(message.value==0){ r_5=false; }
                 }
                 if(message.control==67){
-                    if(message.value==127){ r_10=TRUE; }
-                    if(message.value==0){ r_10=FALSE; }
+                    if(message.value==127){ r_10=true; }
+                    if(message.value==0){ r_10=false; }
                 }
                 if(message.control==36){
-                    if(message.value==127){ huexx_0=TRUE; }
-                    if(message.value==0){ huexx_0=FALSE; }
+                    if(message.value==127){ huexx_0=true; }
+                    if(message.value==0){ huexx_0=false; }
                 }
                 if(message.control==52){
-                    if(message.value==127){ huexx_1=TRUE; }
-                    if(message.value==0){ huexx_1=FALSE; }
+                    if(message.value==127){ huexx_1=true; }
+                    if(message.value==0){ huexx_1=false; }
                 }
                 if(message.control==68){
-                    if(message.value==127){ huexx_2=TRUE; }
-                    if(message.value==0){ huexx_2=FALSE; }
+                    if(message.value==127){ huexx_2=true; }
+                    if(message.value==0){ huexx_2=false; }
                 }
                 if(message.control==46){
-                    if(message.value==127){ toroidSwitch=TRUE; }
-                    if(message.value==0){ toroidSwitch=FALSE; }
+                    if(message.value==127){ toroidSwitch=true; }
+                    if(message.value==0){ toroidSwitch=false; }
                 }
                 if(message.control==61){
-                    if(message.value==127){ mirrorSwitch=TRUE; }
-                    if(message.value==0){ mirrorSwitch=FALSE; }
+                    if(message.value==127){ mirrorSwitch=true; }
+                    if(message.value==0){ mirrorSwitch=false; }
                 }
-                if(y_skew_switch==TRUE){ y_skew+=.00001; }
-                if(x_skew_switch==TRUE){ x_skew+=.00001; }
+                if(y_skew_switch==true){ y_skew+=.00001; }
+                if(x_skew_switch==true){ x_skew+=.00001; }
                 if(message.control==71){
-                    if(message.value==127){ wet_dry_switch=FALSE; }
-                    if(message.value==0){ wet_dry_switch=TRUE; }
+                    if(message.value==127){ wet_dry_switch=false; }
+                    if(message.value==0){ wet_dry_switch=true; }
                 }
                 if(message.control==37){
-                    if(message.value==127){ huexy_0=TRUE; }
-                    if(message.value==0){ huexy_0=FALSE; }
+                    if(message.value==127){ huexy_0=true; }
+                    if(message.value==0){ huexy_0=false; }
                 }
                 if(message.control==53){
-                    if(message.value==127){ huexy_1=TRUE; }
-                    if(message.value==0){ huexy_1=FALSE; }
+                    if(message.value==127){ huexy_1=true; }
+                    if(message.value==0){ huexy_1=false; }
                 }
                 if(message.control==69){
-                    if(message.value==127){ huexy_2=TRUE; }
-                    if(message.value==0){ huexy_2=FALSE; }
+                    if(message.value==127){ huexy_2=true; }
+                    if(message.value==0){ huexy_2=false; }
                 }
                 if(message.control==38){
-                    if(message.value==127){ huexz_0=TRUE; }
-                    if(message.value==0){ huexz_0=FALSE; }
+                    if(message.value==127){ huexz_0=true; }
+                    if(message.value==0){ huexz_0=false; }
                 }
                 if(message.control==54){
-                    if(message.value==127){ huexz_1=TRUE; }
-                    if(message.value==0){ huexz_1=FALSE; }
+                    if(message.value==127){ huexz_1=true; }
+                    if(message.value==0){ huexz_1=false; }
                 }
                 if(message.control==70){
-                    if(message.value==127){ huexz_2=TRUE; }
-                    if(message.value==0){ huexz_2=FALSE; }
+                    if(message.value==127){ huexz_2=true; }
+                    if(message.value==0){ huexz_2=false; }
                 }
                 if(message.control==60){
-                    if(message.value==127){ lumakeyInvertSwitch=TRUE; }
-                    if(message.value==0){ lumakeyInvertSwitch=FALSE; }
+                    if(message.value==127){ lumakeyInvertSwitch=true; }
+                    if(message.value==0){ lumakeyInvertSwitch=false; }
                 }
 
                 // ============================================================
@@ -1843,9 +1922,9 @@ void ofApp::midibiz(){
                         }
                         if(midiLowActiveFloat[8]==1){
                             lowC9=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(x_2==TRUE){ lowC9=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(x_5==TRUE){ lowC9=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(x_10==TRUE){ lowC9=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_2==true){ lowC9=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_5==true){ lowC9=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_10==true){ lowC9=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==2){
@@ -1856,9 +1935,9 @@ void ofApp::midibiz(){
                         }
                         if(midiMidActiveFloat[8]==1){
                             midC9=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(x_2==TRUE){ midC9=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(x_5==TRUE){ midC9=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(x_10==TRUE){ midC9=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_2==true){ midC9=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_5==true){ midC9=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_10==true){ midC9=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==3){
@@ -1869,9 +1948,9 @@ void ofApp::midibiz(){
                         }
                         if(midiHighActiveFloat[8]==1){
                             highC9=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(x_2==TRUE){ highC9=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(x_5==TRUE){ highC9=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(x_10==TRUE){ highC9=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_2==true){ highC9=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_5==true){ highC9=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_10==true){ highC9=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                 }
@@ -1907,9 +1986,9 @@ void ofApp::midibiz(){
                         }
                         if(midiLowActiveFloat[9]==1){
                             lowC10=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(y_2==TRUE){ lowC10=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(y_5==TRUE){ lowC10=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(y_10==TRUE){ lowC10=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_2==true){ lowC10=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_5==true){ lowC10=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_10==true){ lowC10=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==2){
@@ -1920,9 +1999,9 @@ void ofApp::midibiz(){
                         }
                         if(midiMidActiveFloat[9]==1){
                             midC10=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(y_2==TRUE){ midC10=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(y_5==TRUE){ midC10=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(y_10==TRUE){ midC10=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_2==true){ midC10=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_5==true){ midC10=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_10==true){ midC10=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==3){
@@ -1933,9 +2012,9 @@ void ofApp::midibiz(){
                         }
                         if(midiHighActiveFloat[9]==1){
                             highC10=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(y_2==TRUE){ highC10=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(y_5==TRUE){ highC10=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(y_10==TRUE){ highC10=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_2==true){ highC10=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_5==true){ highC10=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_10==true){ highC10=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                 }
@@ -1971,9 +2050,9 @@ void ofApp::midibiz(){
                         }
                         if(midiLowActiveFloat[10]==1){
                             lowC11=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(z_2==TRUE){ lowC11=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(z_5==TRUE){ lowC11=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(z_10==TRUE){ lowC11=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_2==true){ lowC11=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_5==true){ lowC11=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_10==true){ lowC11=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==2){
@@ -1984,9 +2063,9 @@ void ofApp::midibiz(){
                         }
                         if(midiMidActiveFloat[10]==1){
                             midC11=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(z_2==TRUE){ midC11=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(z_5==TRUE){ midC11=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(z_10==TRUE){ midC11=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_2==true){ midC11=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_5==true){ midC11=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_10==true){ midC11=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==3){
@@ -1997,9 +2076,9 @@ void ofApp::midibiz(){
                         }
                         if(midiHighActiveFloat[10]==1){
                             highC11=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(z_2==TRUE){ highC11=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(z_5==TRUE){ highC11=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(z_10==TRUE){ highC11=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_2==true){ highC11=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_5==true){ highC11=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_10==true){ highC11=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                 }
@@ -2035,9 +2114,9 @@ void ofApp::midibiz(){
                         }
                         if(midiLowActiveFloat[11]==1){
                             lowC12=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(r_2==TRUE){ lowC12=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(r_5==TRUE){ lowC12=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(r_10==TRUE){ lowC12=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_2==true){ lowC12=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_5==true){ lowC12=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_10==true){ lowC12=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==2){
@@ -2048,9 +2127,9 @@ void ofApp::midibiz(){
                         }
                         if(midiMidActiveFloat[11]==1){
                             midC12=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(r_2==TRUE){ midC12=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(r_5==TRUE){ midC12=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(r_10==TRUE){ midC12=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_2==true){ midC12=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_5==true){ midC12=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_10==true){ midC12=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==3){
@@ -2061,9 +2140,9 @@ void ofApp::midibiz(){
                         }
                         if(midiHighActiveFloat[11]==1){
                             highC12=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(r_2==TRUE){ highC12=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(r_5==TRUE){ highC12=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(r_10==TRUE){ highC12=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_2==true){ highC12=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_5==true){ highC12=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_10==true){ highC12=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                 }
@@ -2099,9 +2178,9 @@ void ofApp::midibiz(){
                         }
                         if(midiLowActiveFloat[12]==1){
                             lowC13=(message.value)/32.0f;
-                            if(huexx_0==TRUE){ lowC13=message.value/64.0f; }
-                            if(huexx_1==TRUE){ lowC13=message.value/96.0f; }
-                            if(huexx_2==TRUE){ lowC13=message.value/127.0f; }
+                            if(huexx_0==true){ lowC13=message.value/64.0f; }
+                            if(huexx_1==true){ lowC13=message.value/96.0f; }
+                            if(huexx_2==true){ lowC13=message.value/127.0f; }
                         }
                     }
                     if(audioReactiveControlSwitch==2){
@@ -2112,9 +2191,9 @@ void ofApp::midibiz(){
                         }
                         if(midiMidActiveFloat[12]==1){
                             midC13=(message.value)/32.0f;
-                            if(huexx_0==TRUE){ midC13=message.value/64.0f; }
-                            if(huexx_1==TRUE){ midC13=message.value/96.0f; }
-                            if(huexx_2==TRUE){ midC13=message.value/127.0f; }
+                            if(huexx_0==true){ midC13=message.value/64.0f; }
+                            if(huexx_1==true){ midC13=message.value/96.0f; }
+                            if(huexx_2==true){ midC13=message.value/127.0f; }
                         }
                     }
                     if(audioReactiveControlSwitch==3){
@@ -2125,9 +2204,9 @@ void ofApp::midibiz(){
                         }
                         if(midiHighActiveFloat[12]==1){
                             highC13=(message.value)/32.0f;
-                            if(huexx_0==TRUE){ highC13=message.value/64.0f; }
-                            if(huexx_1==TRUE){ highC13=message.value/96.0f; }
-                            if(huexx_2==TRUE){ highC13=message.value/127.0f; }
+                            if(huexx_0==true){ highC13=message.value/64.0f; }
+                            if(huexx_1==true){ highC13=message.value/96.0f; }
+                            if(huexx_2==true){ highC13=message.value/127.0f; }
                         }
                     }
                 }
@@ -2163,9 +2242,9 @@ void ofApp::midibiz(){
                         }
                         if(midiLowActiveFloat[13]==1){
                             lowC14=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(huexy_0==TRUE){ lowC14=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexy_1==TRUE){ lowC14=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexy_2==TRUE){ lowC14=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_0==true){ lowC14=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_1==true){ lowC14=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_2==true){ lowC14=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==2){
@@ -2176,9 +2255,9 @@ void ofApp::midibiz(){
                         }
                         if(midiMidActiveFloat[13]==1){
                             midC14=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(huexy_0==TRUE){ midC14=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexy_1==TRUE){ midC14=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexy_2==TRUE){ midC14=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_0==true){ midC14=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_1==true){ midC14=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_2==true){ midC14=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==3){
@@ -2189,9 +2268,9 @@ void ofApp::midibiz(){
                         }
                         if(midiHighActiveFloat[13]==1){
                             highC14=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(huexy_0==TRUE){ highC14=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexy_1==TRUE){ highC14=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexy_2==TRUE){ highC14=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_0==true){ highC14=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_1==true){ highC14=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_2==true){ highC14=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                 }
@@ -2227,9 +2306,9 @@ void ofApp::midibiz(){
                         }
                         if(midiLowActiveFloat[14]==1){
                             lowC15=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(huexz_0==TRUE){ lowC15=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexz_1==TRUE){ lowC15=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexz_2==TRUE){ lowC15=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_0==true){ lowC15=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_1==true){ lowC15=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_2==true){ lowC15=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==2){
@@ -2240,9 +2319,9 @@ void ofApp::midibiz(){
                         }
                         if(midiMidActiveFloat[14]==1){
                             midC15=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(huexz_0==TRUE){ midC15=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexz_1==TRUE){ midC15=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexz_2==TRUE){ midC15=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_0==true){ midC15=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_1==true){ midC15=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_2==true){ midC15=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                     if(audioReactiveControlSwitch==3){
@@ -2253,9 +2332,9 @@ void ofApp::midibiz(){
                         }
                         if(midiHighActiveFloat[14]==1){
                             highC15=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
-                            if(huexz_0==TRUE){ highC15=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexz_1==TRUE){ highC15=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
-                            if(huexz_2==TRUE){ highC15=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_0==true){ highC15=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_1==true){ highC15=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_2==true){ highC15=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
                         }
                     }
                 }
@@ -2309,28 +2388,28 @@ void ofApp::midibiz(){
                 // BOOLEAN CONTROLS
                 // ============================================================
                 if(message.control==60){
-                    if(message.value==127){ brightInvert=TRUE; }
-                    if(message.value==0){ brightInvert=FALSE; }
+                    if(message.value==127){ brightInvert=true; }
+                    if(message.value==0){ brightInvert=false; }
                 }
                 if(message.control==61){
-                    if(message.value==127){ saturationInvert=TRUE; }
-                    if(message.value==0){ saturationInvert=FALSE; }
+                    if(message.value==127){ saturationInvert=true; }
+                    if(message.value==0){ saturationInvert=false; }
                 }
                 if(message.control==62){
-                    if(message.value==127){ hueInvert=TRUE; }
-                    if(message.value==0){ hueInvert=FALSE; }
+                    if(message.value==127){ hueInvert=true; }
+                    if(message.value==0){ hueInvert=false; }
                 }
                 if(message.control==90){
-                    if(message.value==127){ hdmi_aspect_ratio_switch=TRUE; }
-                    if(message.value==0){ hdmi_aspect_ratio_switch=FALSE; }
+                    if(message.value==127){ hdmi_aspect_ratio_switch=true; }
+                    if(message.value==0){ hdmi_aspect_ratio_switch=false; }
                 }
                 if(message.control==41){
-                    if(message.value==127){ horizontalMirror=TRUE; }
-                    if(message.value==0){ horizontalMirror=FALSE; }
+                    if(message.value==127){ horizontalMirror=true; }
+                    if(message.value==0){ horizontalMirror=false; }
                 }
                 if(message.control==45){
-                    if(message.value==127){ verticalMirror=TRUE; }
-                    if(message.value==0){ verticalMirror=FALSE; }
+                    if(message.value==127){ verticalMirror=true; }
+                    if(message.value==0){ verticalMirror=false; }
                 }
                 if(message.control==59){
                     if(message.value==127){
@@ -2421,27 +2500,27 @@ void ofApp::midibizOld(){
                 }
                 if(message.control==32){
                     if(message.value==127){
-                        x_2=TRUE;
+                        x_2=true;
                     }
                     if(message.value==0){
-                        x_2=FALSE;
+                        x_2=false;
                     }
                 }
                 if(message.control==48){
                     if(message.value==127){
-                        x_5=TRUE;
+                        x_5=true;
                     }
                     if(message.value==0){
-                        x_5=FALSE;
+                        x_5=false;
                     }
                 }
                 if(message.control==64){
                     if(message.value==127){
-                        x_10=TRUE;
+                        x_10=true;
                     }
                     
                     if(message.value==0){
-                        x_10=FALSE;
+                        x_10=false;
                     }
                 }
                 
@@ -2449,31 +2528,31 @@ void ofApp::midibizOld(){
                 
                 if(message.control==33){
                     if(message.value==127){
-                        y_2=TRUE;
+                        y_2=true;
                     }
                     
                     if(message.value==0){
-                        y_2=FALSE;
+                        y_2=false;
                     }
                 }
                 
                 if(message.control==49){
                     if(message.value==127){
-                        y_5=TRUE;
+                        y_5=true;
                     }
                     
                     if(message.value==0){
-                        y_5=FALSE;
+                        y_5=false;
                     }
                 }
                 
                 if(message.control==65){
                     if(message.value==127){
-                        y_10=TRUE;
+                        y_10=true;
                     }
                     
                     if(message.value==0){
-                        y_10=FALSE;
+                        y_10=false;
                     }
                 }
                 
@@ -2481,31 +2560,31 @@ void ofApp::midibizOld(){
                 
                 if(message.control==34){
                     if(message.value==127){
-                        z_2=TRUE;
+                        z_2=true;
                     }
                     
                     if(message.value==0){
-                        z_2=FALSE;
+                        z_2=false;
                     }
                 }
                 
                 if(message.control==50){
                     if(message.value==127){
-                        z_5=TRUE;
+                        z_5=true;
                     }
                     
                     if(message.value==0){
-                        z_5=FALSE;
+                        z_5=false;
                     }
                 }
                 
                 if(message.control==66){
                     if(message.value==127){
-                        z_10=TRUE;
+                        z_10=true;
                     }
                     
                     if(message.value==0){
-                        z_10=FALSE;
+                        z_10=false;
                     }
                 }
                 
@@ -2514,31 +2593,31 @@ void ofApp::midibizOld(){
                 
                 if(message.control==35){
                     if(message.value==127){
-                        r_2=TRUE;
+                        r_2=true;
                     }
                     
                     if(message.value==0){
-                        r_2=FALSE;
+                        r_2=false;
                     }
                 }
                 
                 if(message.control==51){
                     if(message.value==127){
-                        r_5=TRUE;
+                        r_5=true;
                     }
                     
                     if(message.value==0){
-                        r_5=FALSE;
+                        r_5=false;
                     }
                 }
                 
                 if(message.control==67){
                     if(message.value==127){
-                        r_10=TRUE;
+                        r_10=true;
                     }
                     
                     if(message.value==0){
-                        r_10=FALSE;
+                        r_10=false;
                     }
                 }
                 
@@ -2547,63 +2626,63 @@ void ofApp::midibizOld(){
                 
                 if(message.control==36){
                     if(message.value==127){
-                        huexx_0=TRUE;
+                        huexx_0=true;
                     }
                     
                     if(message.value==0){
-                        huexx_0=FALSE;
+                        huexx_0=false;
                     }
                 }
                 
                 if(message.control==52){
                     if(message.value==127){
-                        huexx_1=TRUE;
+                        huexx_1=true;
                     }
                     
                     if(message.value==0){
-                        huexx_1=FALSE;
+                        huexx_1=false;
                     }
                 }
                 
                 if(message.control==68){
                     if(message.value==127){
-                        huexx_2=TRUE;
+                        huexx_2=true;
                     }
                     
                     if(message.value==0){
-                        huexx_2=FALSE;
+                        huexx_2=false;
                     }
                 }
                 
                 if(message.control==46){
                     if(message.value==127){
-                        toroidSwitch=TRUE;
+                        toroidSwitch=true;
                     }
                     
                     if(message.value==0){
-                        toroidSwitch=FALSE;
+                        toroidSwitch=false;
                     }
                 }
                 
                 
                 
                 
-                if(y_skew_switch==TRUE){
+                if(y_skew_switch==true){
                     y_skew+=.00001;
                 }
                 
-                if(x_skew_switch==TRUE){
+                if(x_skew_switch==true){
                     x_skew+=.00001;
                 }
                 
                 
                 if(message.control==71){
                     if(message.value==127){
-                        wet_dry_switch=FALSE;
+                        wet_dry_switch=false;
                     }
                     
                     if(message.value==0){
-                        wet_dry_switch=TRUE;
+                        wet_dry_switch=true;
                     }
                     
                 }
@@ -2614,31 +2693,31 @@ void ofApp::midibizOld(){
                 
                 if(message.control==37){
                     if(message.value==127){
-                        huexy_0=TRUE;
+                        huexy_0=true;
                     }
                     
                     if(message.value==0){
-                        huexy_0=FALSE;
+                        huexy_0=false;
                     }
                 }
                 
                 if(message.control==53){
                     if(message.value==127){
-                        huexy_1=TRUE;
+                        huexy_1=true;
                     }
                     
                     if(message.value==0){
-                        huexy_1=FALSE;
+                        huexy_1=false;
                     }
                 }
                 
                 if(message.control==69){
                     if(message.value==127){
-                        huexy_2=TRUE;
+                        huexy_2=true;
                     }
                     
                     if(message.value==0){
-                        huexy_2=FALSE;
+                        huexy_2=false;
                     }
                 }
                 
@@ -2649,31 +2728,31 @@ void ofApp::midibizOld(){
                 
                 if(message.control==38){
                     if(message.value==127){
-                        huexz_0=TRUE;
+                        huexz_0=true;
                     }
                     
                     if(message.value==0){
-                        huexz_0=FALSE;
+                        huexz_0=false;
                     }
                 }
                 
                 if(message.control==54){
                     if(message.value==127){
-                        huexz_1=TRUE;
+                        huexz_1=true;
                     }
                     
                     if(message.value==0){
-                        huexz_1=FALSE;
+                        huexz_1=false;
                     }
                 }
                 
                 if(message.control==70){
                     if(message.value==127){
-                        huexz_2=TRUE;
+                        huexz_2=true;
                     }
                     
                     if(message.value==0){
-                        huexz_2=FALSE;
+                        huexz_2=false;
                     }
                 }
                 if(message.control==43){
@@ -2880,14 +2959,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==0){
                         p_lock[8][p_lock_increment]=(message.value-63)/63.0f;
                         
-                        if(x_2==TRUE){
+                        if(x_2==true){
                             p_lock[8][p_lock_increment]=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(x_5==TRUE){
+                        if(x_5==true){
                             p_lock[8][p_lock_increment]=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(x_10==TRUE){
+                        if(x_10==true){
                             p_lock[8][p_lock_increment]=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -2895,14 +2974,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==1){
                         lowC9=(message.value-63)/63.0f;
                         
-                        if(x_2==TRUE){
+                        if(x_2==true){
                             lowC9=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(x_5==TRUE){
+                        if(x_5==true){
                             lowC9=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(x_10==TRUE){
+                        if(x_10==true){
                             lowC9=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -2910,14 +2989,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==2){
                         midC9=(message.value-63)/63.0f;
                         
-                        if(x_2==TRUE){
+                        if(x_2==true){
                             midC9=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(x_5==TRUE){
+                        if(x_5==true){
                             midC9=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(x_10==TRUE){
+                        if(x_10==true){
                             midC9=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -2925,14 +3004,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==3){
                         highC9=(message.value-63)/63.0f;
                         
-                        if(x_2==TRUE){
+                        if(x_2==true){
                             highC9=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(x_5==TRUE){
+                        if(x_5==true){
                             highC9=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(x_10==TRUE){
+                        if(x_10==true){
                             highC9=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -2944,14 +3023,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==0){
                         p_lock[9][p_lock_increment]=(message.value-63)/63.0f;
                         
-                        if(y_2==TRUE){
+                        if(y_2==true){
                             p_lock[9][p_lock_increment]=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(y_5==TRUE){
+                        if(y_5==true){
                             p_lock[9][p_lock_increment]=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(y_10==TRUE){
+                        if(y_10==true){
                             p_lock[9][p_lock_increment]=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -2959,14 +3038,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==1){
                         lowC10=(message.value-63)/63.0f;
                         
-                        if(y_2==TRUE){
+                        if(y_2==true){
                             lowC10=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(y_5==TRUE){
+                        if(y_5==true){
                             lowC10=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(y_10==TRUE){
+                        if(y_10==true){
                             lowC10=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -2974,14 +3053,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==2){
                         midC10=(message.value-63)/63.0f;
                         
-                        if(y_2==TRUE){
+                        if(y_2==true){
                             midC10=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(y_5==TRUE){
+                        if(y_5==true){
                             midC10=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(y_10==TRUE){
+                        if(y_10==true){
                             midC10=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -2989,14 +3068,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==3){
                         highC10=(message.value-63)/63.0f;
                         
-                        if(y_2==TRUE){
+                        if(y_2==true){
                             highC10=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(y_5==TRUE){
+                        if(y_5==true){
                             highC10=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(y_10==TRUE){
+                        if(y_10==true){
                             highC10=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3010,14 +3089,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==0){
                         p_lock[10][p_lock_increment]=(message.value-63.0)/63.0f;
                         
-                        if(z_2==TRUE){
+                        if(z_2==true){
                             p_lock[10][p_lock_increment]=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(z_5==TRUE){
+                        if(z_5==true){
                             p_lock[10][p_lock_increment]=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(z_10==TRUE){
+                        if(z_10==true){
                             p_lock[10][p_lock_increment]=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3025,14 +3104,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==1){
                         lowC11=(message.value-63.0)/63.0f;
                         
-                        if(z_2==TRUE){
+                        if(z_2==true){
                             lowC11=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(z_5==TRUE){
+                        if(z_5==true){
                             lowC11=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(z_10==TRUE){
+                        if(z_10==true){
                             lowC11=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3040,14 +3119,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==2){
                         midC11=(message.value-63.0)/63.0f;
                         
-                        if(z_2==TRUE){
+                        if(z_2==true){
                             midC11=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(z_5==TRUE){
+                        if(z_5==true){
                             midC11=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(z_10==TRUE){
+                        if(z_10==true){
                             midC11=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3055,14 +3134,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==3){
                         highC11=(message.value-63.0)/63.0f;
                         
-                        if(z_2==TRUE){
+                        if(z_2==true){
                             highC11=2.0*(message.value-63.0)/63.0f;
                         }
                         
-                        if(z_5==TRUE){
+                        if(z_5==true){
                             highC11=5.0*(message.value-63.0)/63.0f;
                         }
-                        if(z_10==TRUE){
+                        if(z_10==true){
                             highC11=10.0*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3073,14 +3152,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==0){
                         p_lock[11][p_lock_increment]=(message.value-63)/63.0f;
                         
-                        if(r_2==TRUE){
+                        if(r_2==true){
                             p_lock[11][p_lock_increment]=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(r_5==TRUE){
+                        if(r_5==true){
                             p_lock[11][p_lock_increment]=4*(message.value-63.0)/63.0f;
                         }
-                        if(r_10==TRUE){
+                        if(r_10==true){
                             p_lock[11][p_lock_increment]=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3088,14 +3167,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==1){
                         lowC12=(message.value-63)/63.0f;
                         
-                        if(r_2==TRUE){
+                        if(r_2==true){
                             lowC12=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(r_5==TRUE){
+                        if(r_5==true){
                             lowC12=4*(message.value-63.0)/63.0f;
                         }
-                        if(r_10==TRUE){
+                        if(r_10==true){
                             lowC12=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3103,14 +3182,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==2){
                         midC12=(message.value-63)/63.0f;
                         
-                        if(r_2==TRUE){
+                        if(r_2==true){
                             midC12=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(r_5==TRUE){
+                        if(r_5==true){
                             midC12=4*(message.value-63.0)/63.0f;
                         }
-                        if(r_10==TRUE){
+                        if(r_10==true){
                             midC12=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3118,14 +3197,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==3){
                         highC12=(message.value-63)/63.0f;
                         
-                        if(r_2==TRUE){
+                        if(r_2==true){
                             highC12=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(r_5==TRUE){
+                        if(r_5==true){
                             highC12=4*(message.value-63.0)/63.0f;
                         }
-                        if(r_10==TRUE){
+                        if(r_10==true){
                             highC12=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3138,14 +3217,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==0){
                         p_lock[12][p_lock_increment]=(message.value)/32.0f;
                         
-                        if(huexx_0==TRUE){
+                        if(huexx_0==true){
                             p_lock[12][p_lock_increment]=message.value/64.0f;
                         }
                         
-                        if(huexx_1==TRUE){
+                        if(huexx_1==true){
                             p_lock[12][p_lock_increment]=message.value/96.0f;
                         }
-                        if(huexx_2==TRUE){
+                        if(huexx_2==true){
                             p_lock[12][p_lock_increment]=message.value/127.0f;
                         }
                     }
@@ -3153,14 +3232,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==1){
                         lowC13=(message.value)/32.0f;
                         
-                        if(huexx_0==TRUE){
+                        if(huexx_0==true){
                             lowC13=message.value/64.0f;
                         }
                         
-                        if(huexx_1==TRUE){
+                        if(huexx_1==true){
                             lowC13=message.value/96.0f;
                         }
-                        if(huexx_2==TRUE){
+                        if(huexx_2==true){
                             lowC13=message.value/127.0f;
                         }
                     }
@@ -3168,14 +3247,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==2){
                         midC13=(message.value)/32.0f;
                         
-                        if(huexx_0==TRUE){
+                        if(huexx_0==true){
                             midC13=message.value/64.0f;
                         }
                         
-                        if(huexx_1==TRUE){
+                        if(huexx_1==true){
                             midC13=message.value/96.0f;
                         }
-                        if(huexx_2==TRUE){
+                        if(huexx_2==true){
                             midC13=message.value/127.0f;
                         }
                     }
@@ -3183,14 +3262,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==3){
                         highC13=(message.value)/32.0f;
                         
-                        if(huexx_0==TRUE){
+                        if(huexx_0==true){
                             highC13=message.value/64.0f;
                         }
                         
-                        if(huexx_1==TRUE){
+                        if(huexx_1==true){
                             highC13=message.value/96.0f;
                         }
-                        if(huexx_2==TRUE){
+                        if(huexx_2==true){
                             highC13=message.value/127.0f;
                         }
                     }
@@ -3201,14 +3280,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==0){
                         p_lock[13][p_lock_increment]=(message.value-63.0)/63.0f;
                         
-                        if(huexy_0==TRUE){
+                        if(huexy_0==true){
                             p_lock[13][p_lock_increment]=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(huexy_1==TRUE){
+                        if(huexy_1==true){
                             p_lock[13][p_lock_increment]=4*(message.value-63.0)/63.0f;
                         }
-                        if(huexy_2==TRUE){
+                        if(huexy_2==true){
                             p_lock[13][p_lock_increment]=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3216,14 +3295,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==1){
                         lowC14=(message.value-63.0)/63.0f;
                         
-                        if(huexy_0==TRUE){
+                        if(huexy_0==true){
                             lowC14=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(huexy_1==TRUE){
+                        if(huexy_1==true){
                             lowC14=4*(message.value-63.0)/63.0f;
                         }
-                        if(huexy_2==TRUE){
+                        if(huexy_2==true){
                             lowC14=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3231,14 +3310,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==2){
                         midC14=(message.value-63.0)/63.0f;
                         
-                        if(huexy_0==TRUE){
+                        if(huexy_0==true){
                             midC14=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(huexy_1==TRUE){
+                        if(huexy_1==true){
                             midC14=4*(message.value-63.0)/63.0f;
                         }
-                        if(huexy_2==TRUE){
+                        if(huexy_2==true){
                             midC14=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3246,14 +3325,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==3){
                         highC14=(message.value-63.0)/63.0f;
                         
-                        if(huexy_0==TRUE){
+                        if(huexy_0==true){
                             highC14=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(huexy_1==TRUE){
+                        if(huexy_1==true){
                             highC14=4*(message.value-63.0)/63.0f;
                         }
-                        if(huexy_2==TRUE){
+                        if(huexy_2==true){
                             highC14=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3268,14 +3347,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==0){
                         p_lock[14][p_lock_increment]=(message.value-63.0)/63.0f;
                         
-                        if(huexz_0==TRUE){
+                        if(huexz_0==true){
                             p_lock[14][p_lock_increment]=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(huexz_1==TRUE){
+                        if(huexz_1==true){
                             p_lock[14][p_lock_increment]=4*(message.value-63.0)/63.0f;
                         }
-                        if(huexz_2==TRUE){
+                        if(huexz_2==true){
                             p_lock[14][p_lock_increment]=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3283,14 +3362,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==1){
                         lowC15=(message.value-63.0)/63.0f;
                         
-                        if(huexz_0==TRUE){
+                        if(huexz_0==true){
                             lowC15=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(huexz_1==TRUE){
+                        if(huexz_1==true){
                             lowC15=4*(message.value-63.0)/63.0f;
                         }
-                        if(huexz_2==TRUE){
+                        if(huexz_2==true){
                             lowC15=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3298,14 +3377,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==2){
                         midC15=(message.value-63.0)/63.0f;
                         
-                        if(huexz_0==TRUE){
+                        if(huexz_0==true){
                             midC15=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(huexz_1==TRUE){
+                        if(huexz_1==true){
                             midC15=4*(message.value-63.0)/63.0f;
                         }
-                        if(huexz_2==TRUE){
+                        if(huexz_2==true){
                             midC15=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3313,14 +3392,14 @@ void ofApp::midibizOld(){
                     if(audioReactiveControlSwitch==3){
                         highC15=(message.value-63.0)/63.0f;
                         
-                        if(huexz_0==TRUE){
+                        if(huexz_0==true){
                             highC15=2*(message.value-63.0)/63.0f;
                         }
                         
-                        if(huexz_1==TRUE){
+                        if(huexz_1==true){
                             highC15=4*(message.value-63.0)/63.0f;
                         }
-                        if(huexz_2==TRUE){
+                        if(huexz_2==true){
                             highC15=8*(message.value-63.0)/63.0f;
                         }
                     }
@@ -3354,34 +3433,34 @@ void ofApp::midibizOld(){
                 //cc43 maps to brightInvert
                 if(message.control==60){
                     if(message.value==127){
-                        brightInvert=TRUE;
+                        brightInvert=true;
                     }
                     
                     if(message.value==0){
-                        brightInvert=FALSE;
+                        brightInvert=false;
                     }
                 }
                 
                 //cc44 maps to saturationInvert
                 if(message.control==61){
                     if(message.value==127){
-                        saturationInvert=TRUE;
+                        saturationInvert=true;
                     }
                     
                     if(message.value==0){
-                        saturationInvert=FALSE;
+                        saturationInvert=false;
                     }
                 }
                 
                 if(message.control==62){
                     if(message.value==127){
-                        //hueInvert=TRUE;
-                        hdmi_aspect_ratio_switch=TRUE;
+                        //hueInvert=true;
+                        hdmi_aspect_ratio_switch=true;
                     }
                     
                     if(message.value==0){
-                        //hueInvert=FALSE;
-                        hdmi_aspect_ratio_switch=FALSE;
+                        //hueInvert=false;
+                        hdmi_aspect_ratio_switch=false;
                     }
                 }
                 
@@ -3389,21 +3468,21 @@ void ofApp::midibizOld(){
                 //cc41 maps to horizontalMirror
                 if(message.control==41){
                     if(message.value==127){
-                        horizontalMirror=TRUE;
+                        horizontalMirror=true;
                     }
                     
                     if(message.value==0){
-                        horizontalMirror=FALSE;
+                        horizontalMirror=false;
                     }
                 }
                 //cc45 maps to horizontalMirror
                 if(message.control==45){
                     if(message.value==127){
-                        verticalMirror=TRUE;
+                        verticalMirror=true;
                     }
                     
                     if(message.value==0){
-                        verticalMirror=FALSE;
+                        verticalMirror=false;
                     }
                 }
                 if(message.control==59){

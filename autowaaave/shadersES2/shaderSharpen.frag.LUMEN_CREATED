@@ -1,0 +1,29 @@
+// shaderSharpen fragment shader
+// Post-process sharpening for AUTO_WAAAVE
+precision highp float;
+
+uniform sampler2D tex0;
+uniform float sharpenAmount;
+uniform float vSharpenAmount;
+
+varying vec2 texCoordVarying;
+
+void main()
+{
+    vec2 uv = texCoordVarying;
+    vec2 texel = vec2(1.0/720.0, 1.0/480.0);
+
+    // Sample center and neighbors
+    vec4 center = texture2D(tex0, uv);
+    vec4 left   = texture2D(tex0, uv - vec2(texel.x, 0.0));
+    vec4 right  = texture2D(tex0, uv + vec2(texel.x, 0.0));
+    vec4 up     = texture2D(tex0, uv - vec2(0.0, texel.y));
+    vec4 down   = texture2D(tex0, uv + vec2(0.0, texel.y));
+
+    // Calculate sharpening (unsharp mask)
+    vec4 blur = (left + right + up + down) * 0.25;
+    vec4 sharp = center + (center - blur) * (sharpenAmount + vSharpenAmount);
+
+    // Clamp to valid range
+    gl_FragColor = clamp(sharp, 0.0, 1.0);
+}

@@ -1,0 +1,13 @@
+[Unit]
+Description=Forward Akai Force CC to autowaaave visual offset layer
+After=network-online.target midi-gadget.service
+Wants=network-online.target midi-gadget.service
+
+[Service]
+ExecStart=/usr/bin/python3 /home/admin/force_cc_forward.py
+Restart=always
+RestartSec=2
+User=admin
+
+[Install]
+WantedBy=multi-user.target

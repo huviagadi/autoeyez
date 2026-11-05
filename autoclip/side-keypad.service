@@ -1,0 +1,10 @@
+[Unit]
+Description=Autoeyez SIDE-KEYBOARD Clip Cue Controller
+After=video.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/admin/side_keypad.py
+Restart=always
+RestartSec=2
+User=root

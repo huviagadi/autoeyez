@@ -45,9 +45,9 @@
  *     Ring buttons: Loop toggle, Play/Pause, Skip to next clip
  *
  *   Page 2 - MIXER/LUMA KEY:
- *     Encoder 0: Luma key low threshold
- *     Encoder 1: Luma key high threshold
- *     Encoder 2: Fade to black
+ *     Encoder 0: Source Config menu and low/high threshold editors
+ *     Encoder 1: Renderer menu (luma-key inversion and mirror)
+ *     Encoder 2: Existing global settings menu
  *     Encoder 4: Luma key source select
  *     Encoder 5: Video patch browser
  *     Encoder 6: Audio patch browser
@@ -78,6 +78,20 @@
 #include <Audio.h>
 #include <Wire.h>
 #include <SD.h>
+#include "safe_patch_store.h"
+#include "video_patch_schema.h"
+#include "clip_list_receiver.h"
+#include "clip_folder_menu.h"
+#include "patch_journal.h"
+#include "recall_queue.h"
+#include "patch_slot_bounds.h"
+#include "midi_parameter_defaults.h"
+#include "fft_bands.h"
+#include "fft_spectrum.h"
+#include "line_in_gain.h"
+#include "source_config_menu.h"
+#include "beat_clock.h"
+static_assert(AUDIO_SAMPLE_RATE_EXACT == 44100.0f, "Recalibrate FFT bands for a different sample rate");
 
 // ============================================================
 // PIN DEFINITIONS & CONSTANTS
@@ -101,11 +115,11 @@
 #define LED_LATCH 25          // Storage latch (RCLK/ST_CP)
 
 // LED bit positions in the 595 output byte
-// Physical layout: LEDs 1-4 are function indicators, 5-8 are control toggles
-#define LED_1 3               // Function LED 1 (modulation active)
-#define LED_2 4               // Function LED 2
-#define LED_3 5               // Function LED 3
-#define LED_4 6               // Function LED 4
+// Physical layout: LEDs 1-4 pulse the current beat, 5-8 retain their controls.
+#define LED_1 3
+#define LED_2 4
+#define LED_3 5
+#define LED_4 6
 #define LED_5 7               // Control LED 5
 #define LED_6 0               // Control LED 6 / Page 0 indicator
 #define LED_7 1               // Control LED 7 / Page 1 indicator
@@ -150,6 +164,23 @@ int  videoCmdTail = 0 ;                          // Write position
 // Patch loading state machine
 // When loading a patch, MIDI values are sent one at a time to avoid
 // overwhelming the autowaaave app. patchLoadStep tracks progress.
+autoeyez::VideoPatch pendingVideoPatch;
+char patchTransactionId[17]={};
+char patchTransactionOperation[6]={};
+int patchTransactionSlot=-1;
+bool patchSaveHadPrevious=false;
+bool sourceStateSynced=false;
+autoeyez::RecallQueue queuedRecalls;
+unsigned long recallQueueFullAt=0;
+bool patchTransactionUncertain=false,patchRecoveringSave=false,patchRecoverUndo=false;
+autoeyez::PendingSave pendingSave;
+bool recordPendingSave(const void* data,size_t length);
+bool restorePendingSave();
+void recoverPendingSave();
+bool erasePatchJournal();
+unsigned long patchTransactionSent=0;
+void finishPatchTransaction(const char* status);
+void beginPatchTransaction(const char* operation,int slot,const autoeyez::VideoPatch* patch);
 bool patchLoadPending = false ;   // True while patch load is in progress
 int  patchLoadStep    = 0 ;       // Current step in the load sequence
 unsigned long patchLoadTimer = 0 ;// Throttle timer for staggered sends
@@ -184,6 +215,9 @@ long lastEncPos[18] = {0} ;
 // These are sent as MIDI CC values (0-127 range)
 // Index mapping: Page 0 = indices 0-8, Page 1 = indices 9-17
 int  function_value[18]     { 0, 64, 63, 63, 63, 63, 63, 63, 100,   63, 63, 0, 0, 0, 63, 63, 0, 63 } ;
+
+// Saved base values when in reactive mode (restored on exit)
+int  saved_function_value[18] { 0, 64, 63, 63, 63, 63, 63, 63, 100,   63, 63, 0, 0, 0, 63, 63, 0, 63 } ;
 
 // Reset/default values for each parameter (used by global reset function)
 int  function_reset[18]     { 0, 64, 63, 63, 63, 63, 63, 63, 100,   63, 63, 0, 0, 0, 63, 63, 0, 63 } ;
@@ -222,12 +256,15 @@ bool savedLED[8] = {false} ;
 int  page = 0 ;
 int  function[8] { 0 } ;
 bool function_type[8] = { 0, 0, 0, 0, 0, 0, 0, 1 } ;
-int  function_flash[4] { 0 } ;
 int  react_band = -1 ;
 bool control[8] = { false, false, false, false, false, false, false, false } ;
 bool control_type[8] = { 0, 0, 0, 0, 0, 0, 0, 1 } ;
 
 int cc_reactive[3] = { 43, 44, 42 } ;
+autoeyez::SourceConfigMenu sourceConfigMenu;
+int rendererCursor=0;
+bool rendererLumaInvert=false, rendererMirror=false;
+
 int cc_control[8] = { 60, 46, 62, 61, 41, 45, 71, 59 } ;
 
 bool labelUpdated[9]     = { false, false, false, false, false, false, false, false, false } ;
@@ -235,10 +272,10 @@ bool graphUpdated[9]     = { false, false, false, false, false, false, false, fa
 bool controlUpdated[4]   = { false, false, false, false } ;
 bool functionUpdated[4]  = { false, false, false, false } ;
 
-char clipNames[32][20] ;
+#define MAX_VIDEO_CLIPS 64
+char clipNames[MAX_VIDEO_CLIPS][20] ;
 int  clipCount      = 0 ;
-int  menuScroll     = 0 ;
-int  menuSelection  = 0 ;
+autoeyez::ClipFolderMenu clipMenu;
 bool videoDisplayUpdated = false ;
 bool isPlaying      = true ;
 bool isLooping      = false ;
@@ -251,26 +288,33 @@ int progressPos   = 0 ;
 int progressTotal = 0 ;
 unsigned long menuPressTime = 0 ;
 
-char serialBuf[256] ;
-int  serialBufPos = 0 ;
+autoeyez::SerialLineBuffer serialLines;
+autoeyez::ClipListReceiver clipListReceiver;
 
 // ============================================================
 // MIXER STATE
 // ============================================================
 // The mixer on autoclip has two channels (A and B) that can be sourced
-// from clips, composite inputs, or oscilloscope. These settings control
-// the video mixer via serial commands sent through video_bridge.
+// from clips, composite inputs, or external USB capture. These settings
+// control the video mixer via serial commands sent through video_bridge.
 
-#define NUM_SOURCES 5
+#define NUM_SOURCES 26
 const char* sourceNames[NUM_SOURCES] = {
-  "CLIPS", "COMPOSITE 1", "COMPOSITE 2", "COMPOSITE 3", "OSCILLOSCOPE"
+  "CLIPS", "COMPOSITE 1", "COMPOSITE 2", "COMPOSITE 3", "EXT USB", "SQUIRCLE", "MOIRE", "QUASI", "HYPNO", "CIRCUIT", "SMPTE", "ANCIENT", "SHATI", "ALIEN", "SLICES", "MANDELBRODT", "ASHANOHA", "TILES", "CURLESQUE", "SEIGAIHA", "TRI-PATTERN", "EYE OF EZBHAN", "CHROMAWAVE", "ICEBREAKER", "VOXELSCAPE", "POLY MANGLE"
 } ;
 
 // Luma key source includes "NONE" as first option
-#define NUM_LUMA_SOURCES 6
+#define NUM_LUMA_SOURCES 27
 const char* lumaSourceNames[NUM_LUMA_SOURCES] = {
-  "NONE", "CLIPS", "COMPOSITE 1", "COMPOSITE 2", "COMPOSITE 3", "OSCILLOSCOPE"
+  "NONE", "CLIPS", "COMPOSITE 1", "COMPOSITE 2", "COMPOSITE 3", "EXT USB", "SQUIRCLE", "MOIRE", "QUASI", "HYPNO", "CIRCUIT", "SMPTE", "ANCIENT", "SHATI", "ALIEN", "SLICES", "MANDELBRODT", "ASHANOHA", "TILES", "CURLESQUE", "SEIGAIHA", "TRI-PATTERN", "EYE OF EZBHAN", "CHROMAWAVE", "ICEBREAKER", "VOXELSCAPE", "POLY MANGLE"
 } ;
+
+// EXT USB availability (from autoclip, kept for potential status indicator)
+bool extUsbAvailable = false ;
+
+// EXT USB always shown in menus (displays black if device unplugged)
+#define MAX_SOURCE_INDEX (NUM_SOURCES - 1)
+#define MAX_LUMA_SOURCE_INDEX (NUM_LUMA_SOURCES - 1)
 
 // Mixer page sub-modes (selected by ring buttons on page 2)
 // 0 = Channel A source select, 1 = Mixer/crossfader view, 2 = Channel B source select
@@ -302,6 +346,7 @@ bool     btn6HeldLong         = false ;
 bool     patchFlashActive     = false ;
 unsigned long patchFlashTimer = 0 ;
 bool     patchFlashSaved      = false ;
+bool     patchFlashError      = false ;
 static long enc6Accum           = 0 ;
 int      audioPatchCursor       = 0 ;
 int      audioPatchScroll       = 0 ;
@@ -312,6 +357,7 @@ bool     btn7HeldLong           = false ;
 bool     audioPatchFlashActive  = false ;
 unsigned long audioPatchFlashTimer = 0 ;
 bool     audioPatchFlashSaved   = false ;
+bool     audioPatchFlashError = false ;
 int srcHue    = 0 ;
 int srcSat    = 0 ;
 int srcVal    = 0 ;
@@ -325,6 +371,8 @@ bool suppressDisplay8Draw = false ;  // true while previewing page on display 8
 
 float mixValueSmoothed = 0.0f ;  // smoothed display value
 #define MIX_SMOOTH 0.003f         // 0.0=instant, lower=slower
+unsigned long lastMixerDisplayUpdate = 0 ;
+#define MIXER_DISPLAY_INTERVAL_MS 50  // only redraw mixer display every 50ms (~20fps)
 
 #define P2_LUMA      0
 #define P2_LUMA_HI   1
@@ -333,21 +381,74 @@ float mixValueSmoothed = 0.0f ;  // smoothed display value
 #define P2_AUDIO     4
 #define P2_MIXER     5
 #define P2_FADE      6
-#define P2_COUNT     7
+#define P2_FFT_SMOOTH 7
+#define P2_MOSH      8
+
+int fftSmoothValue = 38 ;  // 0-127, default ~0.3 (38/127)
+int moshValue = 0 ;    // 0-127, 0=off, 127=full mosh
+int chromaValue = 51 ;  // 0-127, chromatic aberration amount (default 40%)
+int crushValue = 0 ;   // 0-127, bit crush amount
+int pixelValue = 13 ;   // 0-127, pixelize amount (default 10%)
+int bleedValue = 0, alignValue = 0, ghostValue = 0, wobbleValue = 0, overdriveValue = 0 ;
+int holdValue = 0, holdReactiveValues[3] = {} ;
+int processingReactiveValues[3][5] = {} ;
+int enc7Mode = 0 ;     // Selected processing row
+int postFxScroll = 0 ;
+bool postFxEditing = false ;
+#define ENC7_MODE_COUNT 10
+const char* enc7ModeLabels[] = { "MOSH", "CHROMA", "CRUSH", "PIXEL", "BLEED", "ALIGN", "GHOST", "WOBBLE", "OVERDRIVE", "HOLD" } ;
+int fftBandDecayValue = 102 ; // 0-127, default ~0.8 (102/127) - additional decay when sustained
+int fftHitValue = 96 ;        // 0-127, default 75% (96/127) - transient jump amount
+int fftSlideValue = 64 ;      // 0-127, default 50% (64/127) - slide-in rate after transient
+static long enc3Accum = 0 ;
+int enc3Mode = 0 ;  // 0=Smooth, 1=Attack, 2=Decay, 3=B-Decay, 4=Hit, 5=Slide
+#define ENC3_MODE_COUNT 6
+const char* enc3ModeLabels[] = { "SMOOTH", "ATTACK", "DECAY", "B-DECAY", "HIT", "SLIDE" } ;
+#define P2_COUNT     9
 bool page2Updated[P2_COUNT] = { false } ;
+// Short-lived shader feedback replaces only OLED 9 and yields to any local
+// mainboard input. Source/parameter values arrive from the macropad via Pi2.
+bool shaderOverlayActive = false ;
+bool shaderOverlayDirty = false ;
+unsigned long shaderOverlaySince = 0 ;
+int shaderOverlayRole = 0, shaderOverlayBand = -1 ;
+int shaderOverlaySource = -1, shaderOverlaySlot = -1, shaderOverlayValue = 0 ;
+int shaderOverlayBase = 64, shaderOverlayPreview = 64 ;
+char shaderOverlayLabel[20] = "SOURCE" ;
+long shaderOverlayEncoderPos[9] = {} ;
+constexpr unsigned long SHADER_OVERLAY_MS = 2500 ;
+int videoFps = 0 ;
+bool videoFpsValid = false, videoFpsDirty = false ;
+unsigned long videoFpsAt = 0 ;
+
 int  fadeToBlackValue    = 0 ;
 static long enc2Accum    = 0 ;
+
+// Settings screen state
+int  settingsCursor      = 0 ;   // LUMA TRACK is first; the final row scrolls into view
+int  settingsScroll      = 0 ;
+bool lumaTrackEnabled    = true ;
+bool fadeEnabled         = false ;
+int  videoOutputMode     = 0 ;   // 0 = HDMI, 1 = COMP, 2 = BOTH
+bool passthruEnabled     = false ;
+bool houseCardEnabled    = false ;
+bool houseLogoEnabled    = false ;
+bool annLogoEnabled      = false ;
+#define SETTINGS_COUNT   7
 
 // Page switching
 int  pendingPage     = -1 ;
 bool enc8HeldLong    = false ;
 bool pageSwitched    = false ;
 bool ledOverride     = false ;  // true when showing page select LEDs
+uint16_t ringConsumed = 0 ;     // ring buttons consumed for page select (ignore their release)
 
 // Encoder accumulators
 static long enc0Accum = 0 ;
 static long enc4Accum = 0 ;
+static long enc7Accum = 0 ;
 static long enc8Accum = 0 ;
+static long lineInGainAccum = 0 ;
 
 // Flash timer
 unsigned long pageFlashTimer = 0 ;
@@ -368,7 +469,7 @@ const char* boot_label[] = {
   "A", "U", "T", "O", "E E E", "Y Y Y", "E E E", "Z Z Z", "<3\n    &"
 } ;
 const char* control_label[] = {
-  "INVERT LUMA", "TOROIDAL", "INVERT HUE", "INVERT SAT",
+  "INVERT BRIGHT", "TOROIDAL", "INVERT HUE", "INVERT SAT",
   "H MIRROR", "V MIRROR", "WET/DRY", "AUDIO & VIDEO"
 } ;
 const char* function_label[]  = { "0x", "2x", "5x", "10x" } ;
@@ -385,21 +486,66 @@ Adafruit_SSD1306 displays[9] {
   Adafruit_SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, &SPI, 15, -1, 14)
 } ;
 
+void dismissShaderOverlay() {
+  if (!shaderOverlayActive) return ;
+  shaderOverlayActive = shaderOverlayDirty = false ;
+  displays[8].clearDisplay() ;
+  if (page == 0) graphUpdated[8] = false ;
+  else if (page == 1) videoDisplayUpdated = false ;
+  else page2Updated[P2_MIXER] = false ;
+}
+
 AudioControlSGTL5000 audioShield ;
 AudioInputI2S audioIn ;
 AudioMixer4 mixer ;
 AudioAnalyzeFFT256 fft ;
+AudioMixer4 passthruMixerL ;
+AudioMixer4 passthruMixerR ;
+AudioOutputI2S audioOut ;
 AudioConnection patchCord1(audioIn, 0, mixer, 0) ;
 AudioConnection patchCord2(audioIn, 1, mixer, 1) ;
 AudioConnection patchCord3(mixer, 0, fft, 0) ;
+AudioConnection patchCord4(audioIn, 0, passthruMixerL, 0) ;
+AudioConnection patchCord5(audioIn, 1, passthruMixerR, 0) ;
+AudioConnection patchCord6(passthruMixerL, 0, audioOut, 0) ;
+AudioConnection patchCord7(passthruMixerR, 0, audioOut, 1) ;
 
-float smoothedLevels[128] = { 0 } ;
-float peakLevels[32] = { 0 } ;
-unsigned long peakHoldStart[32] = { 0 } ;
-#define PEAK_HOLD_MS 1000
-#define PEAK_DECAY   0.0012f
-#define ATTACK  0.8
-#define DECAY 0.09
+autoeyez::FftSpectrum spectrum;
+
+// =============================================================================
+// CONTINUOUS FFT BAND OUTPUT
+// =============================================================================
+// Smoothed band values with asymmetric attack/decay for punchy response
+autoeyez::FftBands fftBandProfile = autoeyez::FftBands::Contiguous;
+float bandLow  = 0.0f ;
+float bandMid  = 0.0f ;
+float bandHigh = 0.0f ;
+
+// Attack/decay rates (adjustable via encoder 3 on page 2)
+float bandAttackRate = 0.5f ;  // 0-1, higher = faster attack
+float bandDecayRate  = 0.8f ;  // 0-1, higher = faster decay
+int fftAttackValue = 64 ;      // 0-127 for patch save
+int fftDecayValue  = 102 ;     // 0-127 for patch save (102 = 0.8)
+
+// CC numbers for continuous FFT output
+#define CC_BAND_LOW  110
+#define CC_BAND_MID  111
+#define CC_BAND_HIGH 112
+#define CC_BAND_FRAME 113
+#define CC_BAND_EXT_FIRST 114  // three 14-bit values, MSB then LSB
+#define BAND_EXT_MAX 32.0f
+#define FFT_SERIAL_COMPAT 0
+
+// Rate limiting: only send if value changed by more than threshold
+int lastBandLowCC  = -1 ;
+int lastBandMidCC  = -1 ;
+int lastBandHighCC = -1 ;
+int lastBandExt[3] = {-1, -1, -1} ;
+#define BAND_CC_THRESHOLD 0  // preserve one-step changes at low signal levels
+#define BAND_SEND_INTERVAL_MS 20  // let each ~23ms FFT snapshot reach the renderer
+unsigned long lastBandSendTime = 0 ;
+unsigned long fftCooldownUntil = 0 ;  // pause FFT MIDI after page changes
+#define FFT_COOLDOWN_MS 2000  // 2s cooldown after page switch
 
 unsigned long lastMidiWatchdog = 0 ;
 #define MIDI_WATCHDOG_MS 2000
@@ -416,6 +562,58 @@ bool midiInitialized = false ;
  * Send a command immediately to autoclip via serial.
  * Use for real-time controls that need immediate response.
  */
+#include "controller_perf.h"
+#include "controller_work.h"
+autoeyez::ControllerPerf controllerPerf;
+autoeyez::OledBudget oledBudget;
+autoeyez::FftSnapshot fftSnapshot;
+autoeyez::BeatClock beatClock;
+uint32_t spectrumGeneration=0;
+void transferControllerDisplay(int index){unsigned long started=micros();displays[index].display();controllerPerf.display(micros()-started);}
+void drawVideoFpsBadge(){
+  auto& screen = displays[8] ;
+  screen.fillRect(107, 0, 21, 10, SSD1306_BLACK) ;
+  if (!videoFpsValid) return ;
+  char value[4] ; snprintf(value, sizeof(value), "%d", videoFps) ;
+  screen.setTextSize(1) ; screen.setTextColor(SSD1306_WHITE) ;
+  screen.setCursor(126 - int(strlen(value)) * 6, 1) ;
+  screen.print(value) ;
+}
+void flushDisplay(int index){
+  if(index==8)drawVideoFpsBadge();
+  if(!midiInitialized)transferControllerDisplay(index);else oledBudget.mark(index);
+}
+void serviceControllerOled(){if(!midiInitialized)return;int index=oledBudget.next(micros());if(index>=0)transferControllerDisplay(index);}
+void refreshControllerFft(){
+  AudioNoInterrupts();
+  if(fft.available()){fftSnapshot.capture(fft.output);controllerPerf.fftReads+=128;}
+  AudioInterrupts();
+}
+float readControllerFft(unsigned bin){return fftSnapshot.read(bin);}
+autoeyez::BandEnergy controllerBands(float gain){
+  static bool valid=false;static uint32_t generation=0;static float previousGain=0;
+  static autoeyez::FftBands profile=autoeyez::FftBands::Contiguous;static autoeyez::BandEnergy bands{0,0,0};
+  if(!valid||generation!=fftSnapshot.generation||gain!=previousGain||profile!=fftBandProfile){
+    bands=autoeyez::readFftBands([](unsigned int bin){return readControllerFft(bin);},gain,fftBandProfile);
+    valid=true;generation=fftSnapshot.generation;previousGain=gain;profile=fftBandProfile;
+  }
+  return bands;
+}
+void reportControllerPerf(){
+  if(!booted || !midiInitialized || millis()<10000)return;
+  static unsigned long reported=0;if(millis()-reported<5000)return;reported=millis();
+  char message[360];snprintf(message,sizeof(message),"CTRL_PERF:{\"page\":%d,\"loops\":%lu,\"loop_p95_us\":%lu,\"loop_max_us\":%lu,\"gap_max_us\":%lu,\"oled_count\":%lu,\"oled_total_us\":%lu,\"oled_max_us\":%lu,\"oled_per_loop_max\":%lu,\"fft_reads\":%lu,\"beat_src\":%u,\"beat_step\":%u,\"beat_ms\":%lu,\"beat_candidates\":%u}",page,(unsigned long)controllerPerf.loops,(unsigned long)controllerPerf.p95(),(unsigned long)controllerPerf.workMax,(unsigned long)controllerPerf.gapMax,(unsigned long)controllerPerf.oledCount,(unsigned long)controllerPerf.oledTotal,(unsigned long)controllerPerf.oledMax,(unsigned long)controllerPerf.oledPerLoopMax,(unsigned long)controllerPerf.fftReads,unsigned(beatClock.source),unsigned(beatClock.step),(unsigned long)beatClock.periodMs,unsigned(beatClock.candidateCount));
+  if(Serial.availableForWrite()>=int(strlen(message)+2)){
+    Serial.println(message);controllerPerf.reset();
+    if (beatClock.source==autoeyez::BeatClock::Audio && beatClock.candidateCount>1) {
+      char onsetLine[240];int used=snprintf(onsetLine,sizeof(onsetLine),"BEAT_CAND:%lu",(unsigned long)beatClock.periodMs);
+      unsigned count=min(unsigned(beatClock.candidateCount-1),unsigned(16));
+      for(unsigned i=0;i<count && used<int(sizeof(onsetLine))-16;++i)
+        used+=snprintf(onsetLine+used,sizeof(onsetLine)-used,",%lu:%u",(unsigned long)(beatClock.candidates[i]-beatClock.candidates[i+1]),unsigned(beatClock.candidateStrength[i]*10));
+      if(Serial.availableForWrite()>=used+2)Serial.println(onsetLine);
+    }
+  }
+}
 void sendVideoCommand(const char* cmd) { Serial.println(cmd) ; }
 
 /**
@@ -438,7 +636,7 @@ void queueVideoCommand(const char* cmd) {
  */
 void flushVideoQueue() {
   static unsigned long lastFlush = 0 ;
-  if (patchLoadPending) return ;              // Pause queue during patch load
+  // Patch transactions use their own acknowledged path; controls keep flowing.
   if (videoCmdHead == videoCmdTail) return ;  // Queue empty
   if (millis() - lastFlush < 15) return ;     // Rate limit (mixer polls at 10ms)
   lastFlush = millis() ;
@@ -459,11 +657,101 @@ void flushVideoQueue() {
  *   LIST:a,b,c,...  - Full clip list (comma-separated names)
  *   PROGRESS:p:d    - Playback position (seconds) and duration
  */
+void restorePatchBackup(int slot) ;
+void loadPatch(int slot) ;
 void handleSerialMessage(const char* msg) {
+  if (strncmp(msg, "PATCH_LOAD:", 11) == 0) {
+    const char* number = msg + 11 ;
+    if (number[0] >= '0' && number[0] <= '9' &&
+        number[1] >= '0' && number[1] <= '9' && number[2] == '\0') {
+      const int slot = (number[0] - '0') * 10 + number[1] - '0' - 1 ;
+      if (slot >= 0 && slot < 32 && !patchLoadPending) loadPatch(slot) ;
+      else Serial.println("PATCH_LOAD_ERROR:BUSY_OR_SLOT") ;
+    } else Serial.println("PATCH_LOAD_ERROR:INVALID_SLOT") ;
+    return ;
+  }
+  if (strncmp(msg, "PATCH_BACKUP_RESTORE:", 21) == 0) {
+    const char* number = msg + 21 ;
+    if (number[0] >= '0' && number[0] <= '9' &&
+        number[1] >= '0' && number[1] <= '9' && number[2] == '\0') {
+      restorePatchBackup((number[0] - '0') * 10 + number[1] - '0' - 1) ;
+    } else Serial.println("PATCH_BACKUP_ERROR:INVALID_SLOT") ;
+    return ;
+  }
+  if (strncmp(msg, "FPS:", 4) == 0) {
+    const char* value = msg + 4 ;
+    if (*value && strlen(value) <= 3) {
+      int fps = 0 ; bool valid = true ;
+      for (const char* digit = value ; *digit ; ++digit) {
+        if (*digit < '0' || *digit > '9') { valid = false ; break ; }
+        fps = fps * 10 + (*digit - '0') ;
+      }
+      if (valid) {
+        videoFpsDirty = !videoFpsValid || fps != videoFps ;
+        videoFps = fps ; videoFpsValid = true ; videoFpsAt = millis() ;
+      }
+    }
+    return ;
+  }
+  if (strncmp(msg, "SHADER_UI:", 10) == 0) {
+    int role, band, source, slot, value, base, preview ;
+    char label[20] = {} ;
+    if (sscanf(msg + 10, "%d,%d,%d,%d,%d,%d,%d,%19[^\n]",
+               &role, &band, &source, &slot, &value, &base, &preview, label) == 8 &&
+        role >= 0 && role < 3 && band >= -1 && band < 3 &&
+        source >= -1 && source < NUM_SOURCES && slot >= -1 && slot < 3 &&
+        value >= 0 && value <= 127 && base >= 0 && base <= 127 &&
+        preview >= 0 && preview <= 127 && label[0] != '\0') {
+      shaderOverlayRole = role ; shaderOverlayBand = band ;
+      shaderOverlaySource = source ; shaderOverlaySlot = slot ;
+      shaderOverlayValue = value ; shaderOverlayBase = base ;
+      shaderOverlayPreview = preview ;
+      strncpy(shaderOverlayLabel, label, sizeof(shaderOverlayLabel)-1) ;
+      shaderOverlayLabel[sizeof(shaderOverlayLabel)-1] = '\0' ;
+      for (int i = 0 ; i < 9 ; ++i) shaderOverlayEncoderPos[i] = encoders[i]->read() ;
+      shaderOverlaySince = millis() ;
+      shaderOverlayActive = shaderOverlayDirty = true ;
+    }
+    return ;
+  }
+  if (strncmp(msg,"BEAT:",5)==0) {
+    if (msg[5]>='1' && msg[5]<='4' && msg[6]=='\0')
+      beatClock.midiBeat(uint8_t(msg[5]-'0'),millis());
+    return;
+  }
+  if (strcmp(msg,"BEAT_STOP")==0) { beatClock.midiStop(); return; }
+  char listAck[64];
+  if(clipListReceiver.handle(msg,millis(),clipNames,clipCount,listAck,sizeof(listAck))){
+    if(clipListReceiver.published){
+      clipMenu.reset(clipListReceiver.completedCrc);clipMenu.clamp(clipCount);videoDisplayUpdated=false;
+    }
+    if(listAck[0]&&Serial.availableForWrite()>=int(strlen(listAck)+2))Serial.println(listAck);
+    return;
+  }
+  if(strncmp(msg,"FOL1:",5)==0){
+    if(clipListReceiver.completed[0] && clipMenu.receive(msg,clipListReceiver.completedCrc,clipCount))videoDisplayUpdated=false;
+    return;
+  }
+  if (strncmp(msg,"PTX_ACK:",8)==0) {
+    if(patchLoadPending && strncmp(msg+8,patchTransactionId,16)==0 && msg[24]==':')finishPatchTransaction(msg+25);
+    return;
+  }
+  if(strncmp(msg,"SOURCE_STATE:",13)==0){
+    int a,b,mix,low,high,cut,source,enabled;char extra;
+    if(sscanf(msg+13,"%d,%d,%d,%d,%d,%d,%d,%d%c",&a,&b,&mix,&low,&high,&cut,&source,&enabled,&extra)==8 && a>=0&&a<NUM_SOURCES&&b>=0&&b<NUM_SOURCES&&mix>=0&&mix<=127&&low>=0&&low<=high&&high<=127&&(cut==0||cut==1)&&source>=0&&source<NUM_LUMA_SOURCES&&(enabled==0||enabled==1)){
+      chASource=chASelection=a;chBSource=chBSelection=b;mixValue=mix;mixValueSmoothed=mix;
+      if(enabled)lumaKeyValue=low;lumaHighValue=high;lumaLowEnabled=enabled;lumaHighEnabled=cut;lumaSourceSel=lumaSourceCursor=source;
+      sourceStateSynced=true;page2Updated[P2_LUMA]=false;page2Updated[P2_LUMA_HI]=false;page2Updated[P2_MIXER]=false;page2Updated[P2_LUMA_SRC]=false;
+    }
+    return;
+  }
   // System ready signal from video_bridge (autowaaave is running)
   if (strncmp(msg, "START", 5) == 0) {
     autowaaaveReady = true ;
+    if(CrashReport){Serial.println("CONTROLLER_CRASH_REPORT");Serial.print(CrashReport);}
     Serial.println("GOT_START") ;
+    Serial.println(passthruEnabled ? "AUDIO_PASS:ON" : "AUDIO_PASS:OFF") ;
+    Serial.print("SHADER_BAND:");Serial.println(react_band);
     return ;
   }
 
@@ -492,13 +780,18 @@ void handleSerialMessage(const char* msg) {
   }
   // Full clip list (sent on startup and periodically)
   else if (strncmp(msg, "LIST:", 5) == 0) {
-    clipCount = 0 ;
-    char buf[256] ; strncpy(buf, msg + 5, 255) ; buf[255] = '\0' ;
-    char* token = strtok(buf, ",") ;
-    while (token != NULL && clipCount < 32) {
-      strncpy(clipNames[clipCount], token, 19) ; clipNames[clipCount][19] = '\0' ;
-      clipCount++ ; token = strtok(NULL, ",") ;
+    // A legacy replay cannot overwrite a checksum-confirmed modern list.
+    if(clipListReceiver.completed[0])return;
+    char staged[MAX_VIDEO_CLIPS][20]={};int count=0;const char*cursor=msg+5;
+    while(*cursor){
+      if(count==MAX_VIDEO_CLIPS)return;
+      const char*comma=strchr(cursor,',');size_t length=comma?size_t(comma-cursor):strlen(cursor);
+      if(length==0)return;
+      memcpy(staged[count],cursor,min(length,size_t(19)));count++;
+      if(!comma)break;cursor=comma+1;if(!*cursor)return;
     }
+    memcpy(clipNames,staged,sizeof(staged));clipCount=count;
+    clipMenu.reset(0);clipMenu.clamp(clipCount);
     videoDisplayUpdated = false ;
   }
   // Playback progress (position:duration in seconds)
@@ -507,19 +800,64 @@ void handleSerialMessage(const char* msg) {
     if (colon) { progressPos = atoi(msg + 9) ; progressTotal = atoi(colon + 1) ; }
     videoDisplayUpdated = false ;
   }
+  // EXT USB availability (hot-swap detection)
+  else if (strncmp(msg, "EXT_USB:", 8) == 0) {
+    extUsbAvailable = (atoi(msg + 8) == 1) ;
+  }
+  // Actual video-output state reported by autowaaave.
+  else if (strncmp(msg, "VIDEO_OUT:", 10) == 0) {
+    if (strncmp(msg + 10, "COMP", 4) == 0) videoOutputMode = 1 ;
+    else if (strncmp(msg + 10, "BOTH", 4) == 0) videoOutputMode = 2 ;
+    else videoOutputMode = 0 ;
+    page2Updated[P2_FADE] = false ;
+  }
+  else if (strncmp(msg, "LUMA_TRACK:", 11) == 0) {
+    lumaTrackEnabled = (strncmp(msg + 11, "ON", 2) == 0 || atoi(msg + 11) == 1) ;
+    page2Updated[P2_FADE] = false ;
+  }
+  else if (strcmp(msg, "BANDS?") == 0) {
+    Serial.print("BANDS_OK:"); Serial.println(autoeyez::bandProfileName(fftBandProfile));
+  }
+  else if (strncmp(msg, "BANDS:", 6) == 0) {
+    autoeyez::FftBands requested;
+    if (autoeyez::parseBandProfile(msg + 6, requested)) {
+      if (requested != fftBandProfile) {
+        fftBandProfile = requested;
+        bandLow = bandMid = bandHigh = 0.0f;
+        lastBandLowCC = lastBandMidCC = lastBandHighCC = -999;
+        lastBandSendTime = 0;
+      }
+      Serial.print("BANDS_OK:"); Serial.println(autoeyez::bandProfileName(fftBandProfile));
+    } else Serial.println("BANDS_ERROR");
+  }
+  // Envelope params from Pi (audio patch load) - update display values
+  // Format: ENV:smooth,attack,decay,bdecay[,hit,slide]
+  else if (strncmp(msg, "ENV:", 4) == 0) {
+    int s, a, d, b, h = 96, sl = 64 ;  // defaults for hit/slide if not provided
+    int parsed = sscanf(msg + 4, "%d,%d,%d,%d,%d,%d", &s, &a, &d, &b, &h, &sl) ;
+    if (parsed >= 4) {
+      fftSmoothValue = constrain(s, 0, 127) ;
+      fftAttackValue = constrain(a, 0, 127) ;
+      fftDecayValue = constrain(d, 0, 127) ;
+      fftBandDecayValue = constrain(b, 0, 127) ;
+      bandAttackRate = fftAttackValue / 127.0f ;
+      bandDecayRate = fftDecayValue / 127.0f ;
+      if (parsed >= 6) {
+        fftHitValue = constrain(h, 0, 127) ;
+        fftSlideValue = constrain(sl, 0, 127) ;
+      }
+      page2Updated[P2_FFT_SMOOTH] = false ;  // Trigger display refresh
+      Serial.println("ENV_OK") ;
+    }
+  }
 }
 
 void checkSerial() {
-  while (Serial.available()) {
-    char c = Serial.read() ;
-    if (c == '\n') {
-      serialBuf[serialBufPos] = '\0' ;
-      if (serialBufPos > 0) {
-        if (serialBuf[0] == 'R' && serialBufPos == 1) { _reboot_Teensyduino_() ; }
-        else { handleSerialMessage(serialBuf) ; }
-      }
-      serialBufPos = 0 ;
-    } else if (serialBufPos < 255) { serialBuf[serialBufPos++] = c ; }
+  while(Serial.available()){
+    serialLines.feed(char(Serial.read()),[](const char* line,unsigned length){
+      if(length==1&&line[0]=='R')_reboot_Teensyduino_();
+      else handleSerialMessage(line);
+    });
   }
 }
 
@@ -547,7 +885,7 @@ void setLEDs(byte ledByte) {
 
 void clearScreen(int display_id) {
   displays[display_id].fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT, SSD1306_BLACK) ;
-  displays[display_id].display() ;
+  flushDisplay(display_id) ;
 }
 
 void updateLabel(int display_id, const char* text, int textSize) {
@@ -558,7 +896,7 @@ void updateLabel(int display_id, const char* text, int textSize) {
   displays[display_id].getTextBounds(text, 0, 0, &x1, &y1, &w, &h) ;
   displays[display_id].setCursor((SCREEN_WIDTH - w) / 2, 0) ;
   displays[display_id].println(text) ;
-  displays[display_id].display() ;
+  flushDisplay(display_id) ;
 }
 
 void updateControlLabel(int display_id, const char* text, int textSize, int type, int value) {
@@ -578,7 +916,7 @@ void updateControlLabel(int display_id, const char* text, int textSize, int type
     displays[display_id].setCursor(89, 48) ; displays[display_id].println("RESET") ;
     displays[display_id].setTextColor(SSD1306_WHITE) ;
   }
-  displays[display_id].display() ;
+  flushDisplay(display_id) ;
 }
 
 void updateFunctionLabel(int display_id, const char* text, int textSize, int type, int function_id) {
@@ -590,116 +928,220 @@ void updateFunctionLabel(int display_id, const char* text, int textSize, int typ
     displays[display_id].setCursor(14 + (28 * i), 48) ; displays[display_id].println(function_label[i]) ;
     if (function[function_id] == i) { displays[display_id].setTextColor(SSD1306_WHITE) ; }
   }
-  displays[display_id].display() ;
+  flushDisplay(display_id) ;
 }
 
 void updateGraph(int display_id, int value, int function_id) {
   displays[display_id].fillRect(0, 19, SCREEN_WIDTH, 22, SSD1306_BLACK) ;
-  if (function_direction[function_id] == -1) { value = 127 - value ; }
-  int left  = constrain(map(value, 1, 63, 1, 63), 1, 63) ;
-  int right = constrain(map(value, 64, 126, 63, 127), 63, 126) ;
+
+  // Both encoder pages show the held pre-reactive value and live offset.
+  bool reactiveGraph = react_band >= 0 &&
+                       (function_id < 8 || (function_id >= 9 && function_id < 17)) ;
+  int baseValue = reactiveGraph ? saved_function_value[function_id] : value ;
+  int reactValue = value ;
+
+  if (function_direction[function_id] == -1) {
+    baseValue = 127 - baseValue ;
+    reactValue = 127 - reactValue ;
+  }
+
+  // Draw base bar
   if (function_graphType[function_id] == 0) {
-    displays[display_id].fillRect(1, 26, constrain(value, 1, 126), 12, SSD1306_WHITE) ;
+    // Unipolar: bar from left
+    displays[display_id].fillRect(1, 26, constrain(baseValue, 1, 126), 12, SSD1306_WHITE) ;
   } else {
+    // Bipolar: bar from center
+    int left  = constrain(map(baseValue, 1, 63, 1, 63), 1, 63) ;
+    int right = constrain(map(baseValue, 64, 126, 63, 127), 63, 126) ;
     displays[display_id].fillRect(left, 26, right - left + 1, 12, SSD1306_WHITE) ;
   }
+
+  // Draw reactivity feedback when in reactive mode
+  if (reactiveGraph && baseValue != reactValue) {
+    // Calculate x positions - for unipolar, value maps directly to x position
+    int xBase  = constrain(baseValue, 1, 126) ;
+    int xReact = constrain(reactValue, 1, 126) ;
+
+    if (xReact > xBase) {
+      // Encoder moved right: show new region as WHITE (was black/empty)
+      displays[display_id].fillRect(xBase + 1, 28, xReact - xBase, 8, SSD1306_WHITE) ;
+      // XOR overlap at base position
+      displays[display_id].fillRect(xBase, 28, 1, 8, SSD1306_BLACK) ;
+    } else {
+      // Encoder moved left: show removed region as BLACK (was white/filled)
+      displays[display_id].fillRect(xReact, 28, xBase - xReact + 1, 8, SSD1306_BLACK) ;
+    }
+
+    // Draw white vertical line at react position
+    displays[display_id].drawLine(xReact, 23, xReact, 40, SSD1306_WHITE) ;
+  }
+
   displays[display_id].drawLine(1, 23, 1, 40, SSD1306_WHITE) ;
   displays[display_id].drawLine(126, 23, 126, 40, SSD1306_WHITE) ;
   displays[display_id].drawLine(63, 23, 63, 40, SSD1306_WHITE) ;
   displays[display_id].drawLine(1, 32, 126, 32, SSD1306_WHITE) ;
-  displays[display_id].display() ;
+  flushDisplay(display_id) ;
 }
 
 // ============================================================
 // PAGE 2 DISPLAY FUNCTIONS
 // ============================================================
 
-void drawLumaKeyDisplay() {
-  displays[0].clearDisplay() ;
-  displays[0].setTextColor(SSD1306_WHITE) ;
-  displays[0].setTextSize(2) ;
+// Page 3 lists share a title, divider, and four 12-pixel row slots.
+constexpr int MENU_VISIBLE_ROWS = 4 ;
+constexpr int MENU_ROW_TOP = 15 ;
+constexpr int MENU_ROW_HEIGHT = 12 ;
+int menuRowY(int row) { return MENU_ROW_TOP + row * MENU_ROW_HEIGHT ; }
+
+void keepMenuCursorVisible(int cursor, int& scroll, int count) {
+  scroll = constrain(scroll, 0, max(0, count - MENU_VISIBLE_ROWS)) ;
+  if (cursor < scroll) scroll = cursor ;
+  if (cursor >= scroll + MENU_VISIBLE_ROWS) scroll = cursor - MENU_VISIBLE_ROWS + 1 ;
+}
+
+void drawMenuHeader(int display_id, const char* title) {
+  displays[display_id].setTextSize(1) ;
+  displays[display_id].setTextColor(SSD1306_WHITE) ;
   int16_t x1, y1 ; uint16_t w, h ;
-  displays[0].getTextBounds("LUMA KEY", 0, 0, &x1, &y1, &w, &h) ;
-  displays[0].setCursor((128 - w) / 2, 0) ;
-  displays[0].println("LUMA KEY") ;
-  int val = constrain(lumaKeyValue, 0, 126) ;
-  displays[0].fillRect(1, 26, val, 12, SSD1306_WHITE) ;
-  displays[0].drawLine(1, 23, 1, 40, SSD1306_WHITE) ;
-  displays[0].drawLine(126, 23, 126, 40, SSD1306_WHITE) ;
-  displays[0].drawLine(1, 32, 126, 32, SSD1306_WHITE) ;
-  displays[0].drawFastHLine(2, 45, 124, SSD1306_WHITE) ;
-  displays[0].setTextSize(1) ;
-  displays[0].setCursor(6, 48) ; displays[0].println("LUMA LO") ;
-  if (!lumaLowEnabled) { displays[0].fillRect(83, 47, 19, 9, SSD1306_WHITE) ; displays[0].setTextColor(SSD1306_BLACK) ; }
-  displays[0].setCursor(84, 48) ; displays[0].println("OFF") ;
-  displays[0].setTextColor(SSD1306_WHITE) ;
-  if (lumaLowEnabled)  { displays[0].fillRect(107, 47, 14, 9, SSD1306_WHITE) ; displays[0].setTextColor(SSD1306_BLACK) ; }
-  displays[0].setCursor(108, 48) ; displays[0].println("ON") ;
-  displays[0].setTextColor(SSD1306_WHITE) ;
-  displays[0].display() ;
-  page2Updated[P2_LUMA] = true ;
+  displays[display_id].getTextBounds(title, 0, 0, &x1, &y1, &w, &h) ;
+  displays[display_id].setCursor((SCREEN_WIDTH - w) / 2, 1) ;
+  displays[display_id].println(title) ;
+  displays[display_id].drawFastHLine(2, 11, 124, SSD1306_WHITE) ;
+}
+
+void drawLumaKeyDisplay() {
+  auto& d = displays[0]; d.clearDisplay(); d.setTextColor(SSD1306_WHITE);
+  if (sourceConfigMenu.editing) {
+    d.setTextSize(2);
+    const char* title = sourceConfigMenu.cursor == 1 ? "LUMA LOW" : "LUMA HI";
+    int16_t x,y; uint16_t w,h; d.getTextBounds(title,0,0,&x,&y,&w,&h);
+    d.setCursor((128-w)/2,0); d.print(title);
+    int value = sourceConfigMenu.cursor == 1 ? lumaKeyValue : lumaHighValue;
+    d.fillRect(1,26,constrain(value,0,126),12,SSD1306_WHITE);
+    d.drawLine(1,23,1,40,SSD1306_WHITE); d.drawLine(126,23,126,40,SSD1306_WHITE);
+    d.drawLine(63,23,63,40,SSD1306_WHITE); d.drawLine(1,32,126,32,SSD1306_WHITE);
+    d.setTextSize(1); d.setCursor(25,50); d.print("CLICK: BACK");
+  } else {
+    drawMenuHeader(0, "SOURCE CONFIG") ;
+    const char* labels[] = {"LUMA SOURCE", "LUMA LOW", "LUMA CUT", "LUMA HI"} ;
+    for (int row = 0 ; row < MENU_VISIBLE_ROWS ; row++) {
+      int i = row ;
+      int y = menuRowY(row) ;
+      if (i == sourceConfigMenu.cursor) {
+        d.fillRect(2, y - 1, 124, 11, SSD1306_WHITE) ;
+        d.setTextColor(SSD1306_BLACK) ;
+      } else d.setTextColor(SSD1306_WHITE) ;
+      d.setCursor(6, y) ; d.print(labels[i]) ;
+      char valueBuf[16] ;
+      if (i == 0) snprintf(valueBuf, sizeof(valueBuf), "%s", lumaLowEnabled ? "ON" : "OFF") ;
+      else if (i == 2) snprintf(valueBuf, sizeof(valueBuf), "%s", lumaHighEnabled ? "ON" : "OFF") ;
+      else snprintf(valueBuf, sizeof(valueBuf), "%d", i == 1 ? lumaKeyValue : lumaHighValue) ;
+      int16_t x1, y1 ; uint16_t w, h ;
+      d.getTextBounds(valueBuf, 0, 0, &x1, &y1, &w, &h) ;
+      d.setCursor(122 - w, y) ; d.print(valueBuf) ;
+    }
+  }
+  flushDisplay(0); page2Updated[P2_LUMA]=true;
 }
 
 void drawLumaHighDisplay() {
-  displays[1].clearDisplay() ;
-  displays[1].setTextColor(SSD1306_WHITE) ;
-  displays[1].setTextSize(2) ;
-  int16_t x1, y1 ; uint16_t w, h ;
-  displays[1].getTextBounds("LUMA HI", 0, 0, &x1, &y1, &w, &h) ;
-  displays[1].setCursor((128 - w) / 2, 0) ;
-  displays[1].println("LUMA HI") ;
-  int val = constrain(lumaHighValue, 0, 126) ;
-  displays[1].fillRect(1, 26, val, 12, SSD1306_WHITE) ;
-  displays[1].drawLine(1, 23, 1, 40, SSD1306_WHITE) ;
-  displays[1].drawLine(126, 23, 126, 40, SSD1306_WHITE) ;
-  displays[1].drawLine(1, 32, 126, 32, SSD1306_WHITE) ;
-  displays[1].drawFastHLine(2, 45, 124, SSD1306_WHITE) ;
-  displays[1].setTextSize(1) ;
-  displays[1].setCursor(6, 48) ; displays[1].println("HI CUT") ;
-  if (!lumaHighEnabled) { displays[1].fillRect(83, 47, 19, 9, SSD1306_WHITE) ; displays[1].setTextColor(SSD1306_BLACK) ; }
-  displays[1].setCursor(84, 48) ; displays[1].println("OFF") ;
-  displays[1].setTextColor(SSD1306_WHITE) ;
-  if (lumaHighEnabled)  { displays[1].fillRect(107, 47, 14, 9, SSD1306_WHITE) ; displays[1].setTextColor(SSD1306_BLACK) ; }
-  displays[1].setCursor(108, 48) ; displays[1].println("ON") ;
-  displays[1].setTextColor(SSD1306_WHITE) ;
-  displays[1].display() ;
-  page2Updated[P2_LUMA_HI] = true ;
+  auto& d=displays[1];d.clearDisplay();d.setTextSize(1);d.setTextColor(SSD1306_WHITE);
+  drawMenuHeader(1, "RENDERER") ;
+  const char* labels[]={"LUMA KEY INV","MIRROR"};
+  bool states[]={rendererLumaInvert,rendererMirror};
+  for(int i=0;i<2;++i){int y=menuRowY(i);
+    if(i==rendererCursor){d.fillRect(2,y-1,124,11,SSD1306_WHITE);d.setTextColor(SSD1306_BLACK);}
+    else d.setTextColor(SSD1306_WHITE);
+    d.setCursor(6,y);d.print(labels[i]);
+    d.setCursor(states[i]?110:104,y);d.print(states[i]?"ON":"OFF");
+  }
+  d.setTextColor(SSD1306_WHITE) ;
+  flushDisplay(1);page2Updated[P2_LUMA_HI]=true;
 }
 
-void drawFadeDisplay() {
+void drawSettingsDisplay() {
   displays[2].clearDisplay() ;
+  drawMenuHeader(2, "SETTINGS") ;
+
+  // Setting names
+  const char* settingNames[] = { "LUMA TRACK", "FADE", "VIDEO OUTPUT", "AUDIO PASS", "HOUSE CARD", "HOUSE LOGO", "MAIN LOGO" } ;
+  bool settingValues[] = { lumaTrackEnabled, fadeEnabled, false, passthruEnabled, houseCardEnabled, houseLogoEnabled, annLogoEnabled } ;
+
+  for (int row = 0 ; row < MENU_VISIBLE_ROWS ; row++) {
+    int i = settingsScroll + row ;
+    if (i >= SETTINGS_COUNT) break ;
+    int yPos = menuRowY(row) ;
+    if (i == settingsCursor) {
+      displays[2].fillRect(2, yPos - 1, 124, 11, SSD1306_WHITE) ;
+      displays[2].setTextColor(SSD1306_BLACK) ;
+    } else {
+      displays[2].setTextColor(SSD1306_WHITE) ;
+    }
+
+    displays[2].setCursor(6, yPos) ;
+    displays[2].print(settingNames[i]) ;
+    const char* stateText = (i == 2) ? (videoOutputMode == 0 ? "HDMI" : (videoOutputMode == 1 ? "COMP" : "BOTH")) : (settingValues[i] ? "ON" : "OFF") ;
+    int16_t x1, y1 ; uint16_t w, h ;
+    displays[2].getTextBounds(stateText, 0, 0, &x1, &y1, &w, &h) ;
+    displays[2].setCursor(122 - w, yPos) ;
+    displays[2].print(stateText) ;
+  }
   displays[2].setTextColor(SSD1306_WHITE) ;
-  displays[2].setTextSize(2) ;
-  int16_t x1, y1 ; uint16_t w, h ;
-  displays[2].getTextBounds("FADE", 0, 0, &x1, &y1, &w, &h) ;
-  displays[2].setCursor((128 - w) / 2, 0) ;
-  displays[2].println("FADE") ;
-  int val = constrain(fadeToBlackValue, 0, 126) ;
-  displays[2].fillRect(1, 26, val, 12, SSD1306_WHITE) ;
-  displays[2].drawLine(1, 23, 1, 40, SSD1306_WHITE) ;
-  displays[2].drawLine(126, 23, 126, 40, SSD1306_WHITE) ;
-  displays[2].drawLine(1, 32, 126, 32, SSD1306_WHITE) ;
-  displays[2].display() ;
+  flushDisplay(2) ;
   page2Updated[P2_FADE] = true ;
+}
+
+void drawFftSmoothDisplay() {
+  displays[3].clearDisplay() ;
+  displays[3].setTextColor(SSD1306_WHITE) ;
+  int16_t x1, y1 ; uint16_t w, h ;
+
+  // Get current mode label and value
+  const char* label = enc3ModeLabels[enc3Mode] ;
+  int currentValue ;
+  switch (enc3Mode) {
+    case 0: currentValue = fftSmoothValue ; break ;
+    case 1: currentValue = fftAttackValue ; break ;
+    case 2: currentValue = fftDecayValue ; break ;
+    case 3: currentValue = fftBandDecayValue ; break ;
+    case 4: currentValue = fftHitValue ; break ;
+    case 5: currentValue = fftSlideValue ; break ;
+    default: currentValue = fftSmoothValue ; break ;
+  }
+
+  // Draw label - use smaller font only for B-DECAY
+  displays[3].setTextSize(2) ;
+  displays[3].getTextBounds(label, 0, 0, &x1, &y1, &w, &h) ;
+  displays[3].setCursor((128 - w) / 2, 0) ;
+  displays[3].println(label) ;
+
+  // Draw bar
+  int barVal = constrain(currentValue, 0, 126) ;
+  displays[3].fillRect(1, 26, barVal, 12, SSD1306_WHITE) ;
+  displays[3].drawLine(1, 23, 1, 40, SSD1306_WHITE) ;
+  displays[3].drawLine(126, 23, 126, 40, SSD1306_WHITE) ;
+  displays[3].drawLine(1, 32, 126, 32, SSD1306_WHITE) ;
+
+  // Show percentage
+  char pctBuf[8] ;
+  int pct = (currentValue * 100) / 127 ;
+  snprintf(pctBuf, 8, "%d%%", pct) ;
+  displays[3].getTextBounds(pctBuf, 0, 0, &x1, &y1, &w, &h) ;
+  displays[3].setCursor((128 - w) / 2, 50) ;
+  displays[3].println(pctBuf) ;
+  flushDisplay(3) ;
+  page2Updated[P2_FFT_SMOOTH] = true ;
 }
 
 void drawLumaSourceDisplay() {
   displays[4].clearDisplay() ;
-  displays[4].setTextColor(SSD1306_WHITE) ;
-  displays[4].setTextSize(2) ;
-  int16_t x1, y1 ; uint16_t w, h ;
-  displays[4].getTextBounds("LUMA SRC", 0, 0, &x1, &y1, &w, &h) ;
-  displays[4].setCursor((128 - w) / 2, 0) ;
-  displays[4].println("LUMA SRC") ;
-  displays[4].drawFastHLine(2, 16, 124, SSD1306_WHITE) ;
-  // 3 items, 9px rows, y=18-44, bottom divider y=44
-  for (int i = 0 ; i < 3 ; i++) {
+  drawMenuHeader(4, "LUMA SOURCE") ;
+  for (int i = 0 ; i < MENU_VISIBLE_ROWS ; i++) {
     int idx = lumaSourceScroll + i ;
-    if (idx >= NUM_LUMA_SOURCES) break ;
-    int yPos = 18 + (i * 9) ;
-    displays[4].setTextSize(1) ;
+    if (idx > MAX_LUMA_SOURCE_INDEX) break ;
+    int yPos = menuRowY(i) ;
     if (idx == lumaSourceCursor) {
-      displays[4].fillRect(2, yPos - 1, 124, 9, SSD1306_WHITE) ;
+      displays[4].fillRect(2, yPos - 1, 124, 11, SSD1306_WHITE) ;
       displays[4].setTextColor(SSD1306_BLACK) ;
     } else {
       displays[4].setTextColor(SSD1306_WHITE) ;
@@ -713,8 +1155,7 @@ void drawLumaSourceDisplay() {
     displays[4].println(lumaSourceNames[idx]) ;
   }
   displays[4].setTextColor(SSD1306_WHITE) ;
-  displays[4].drawFastHLine(2, 44, 124, SSD1306_WHITE) ;
-  displays[4].display() ;
+  flushDisplay(4) ;
   page2Updated[P2_LUMA_SRC] = true ;
 }
 
@@ -770,32 +1211,109 @@ void drawMixerDisplay8Content() {
     int selIdx          = (mixerSubMode == 0) ? chASelection : chBSelection ;
     int scrIdx          = (mixerSubMode == 0) ? chAScroll    : chBScroll ;
     int confirmed       = (mixerSubMode == 0) ? chASource    : chBSource ;
-    displays[8].setTextSize(1) ;
-    displays[8].getTextBounds(header, 0, 0, &x1, &y1, &w, &h) ;
-    displays[8].setCursor((128 - w) / 2, 1) ; displays[8].println(header) ;
-    displays[8].drawFastHLine(2, 11, 124, SSD1306_WHITE) ;
-    // 4 items, moved up 1px: y=13+(i*9), bottom divider at y=50
-    for (int i = 0 ; i < 4 ; i++) {
+    drawMenuHeader(8, header) ;
+    for (int i = 0 ; i < MENU_VISIBLE_ROWS ; i++) {
       int idx = scrIdx + i ;
-      if (idx >= NUM_SOURCES) break ;
-      int yPos = 13 + (i * 9) ;
-      if (idx == selIdx) { displays[8].fillRect(2, yPos - 1, 124, 9, SSD1306_WHITE) ; displays[8].setTextColor(SSD1306_BLACK) ; }
+      if (idx > MAX_SOURCE_INDEX) break ;
+      int yPos = menuRowY(i) ;
+      if (idx == selIdx) { displays[8].fillRect(2, yPos - 1, 124, 11, SSD1306_WHITE) ; displays[8].setTextColor(SSD1306_BLACK) ; }
       else { displays[8].setTextColor(SSD1306_WHITE) ; }
       if (idx == confirmed) { displays[8].setCursor(2, yPos) ; displays[8].print(">") ; displays[8].setCursor(14, yPos) ; }
       else { displays[8].setCursor(8, yPos) ; }
       displays[8].println(sourceNames[idx]) ;
     }
     displays[8].setTextColor(SSD1306_WHITE) ;
-    displays[8].drawFastHLine(2, 48, 124, SSD1306_WHITE) ;
-    displays[8].setCursor(2, 56) ; displays[8].println("PUSH ENC TO CONFIRM") ;
   }
 }
 
 void drawMixerDisplay() {
   displays[8].clearDisplay() ;
   drawMixerDisplay8Content() ;
-  displays[8].display() ;
+  flushDisplay(8) ;
   page2Updated[P2_MIXER] = true ;
+}
+
+void drawShaderOverlay() {
+  auto& screen = displays[8] ;
+  screen.clearDisplay() ;
+  screen.setTextColor(SSD1306_WHITE) ;
+  screen.setTextSize(1) ;
+  const char* role = shaderOverlayRole == 0 ? "A" :
+                     shaderOverlayRole == 1 ? "LUMA" : "B" ;
+  const char* band = shaderOverlayBand < 0 ? "OFFSET" :
+                     shaderOverlayBand == 0 ? "LOW" :
+                     shaderOverlayBand == 1 ? "MID" : "HIGH" ;
+  screen.setCursor(2, 1) ; screen.print(role) ; screen.print(' ') ; screen.print(band) ;
+  screen.drawFastHLine(1, 11, 126, SSD1306_WHITE) ;
+  const char* source = shaderOverlaySource >= 0 ?
+                       sourceNames[shaderOverlaySource] : "NONE" ;
+  if (shaderOverlaySlot < 0) {
+    screen.setCursor(2, 19) ; screen.print("SELECTED SOURCE") ;
+    int16_t x1, y1 ; uint16_t w, h ;
+    screen.getTextBounds(source, 0, 0, &x1, &y1, &w, &h) ;
+    screen.setCursor(max(2, (128 - int(w))/2), 37) ;
+    screen.print(source) ;
+  } else {
+    screen.setCursor(2, 15) ; screen.print(source) ;
+    screen.setCursor(2, 27) ; screen.print(shaderOverlayLabel) ;
+    screen.drawRect(2, 41, 124, 11, SSD1306_WHITE) ;
+    const int bar = map(shaderOverlayBase, 0, 127, 0, 120) ;
+    if (bar > 0) screen.fillRect(4, 43, bar, 7, SSD1306_WHITE) ;
+    if (shaderOverlayBand >= 0) {
+      const int baseX = 4 + bar ;
+      const int previewX = 4 + map(shaderOverlayPreview, 0, 127, 0, 120) ;
+      if (previewX > baseX) screen.fillRect(baseX + 1, 44, previewX - baseX, 5, SSD1306_WHITE) ;
+      if (previewX < baseX) screen.fillRect(previewX, 44, baseX - previewX + 1, 5, SSD1306_BLACK) ;
+      screen.drawFastVLine(previewX, 38, 16, SSD1306_WHITE) ;
+    }
+    screen.setCursor(2, 55) ;
+    screen.print("KNOB ") ; screen.print(shaderOverlaySlot + 1) ;
+    screen.setCursor(89, 55) ;
+    if (shaderOverlayBand >= 0) {
+      const int depth = shaderOverlayValue - 64 ;
+      if (depth > 0) screen.print('+') ;
+      screen.print(depth) ;
+    } else screen.print(shaderOverlayValue) ;
+  }
+  flushDisplay(8) ;
+  shaderOverlayDirty = false ;
+}
+
+void drawClipMenuRows() {
+  auto& screen=displays[8];
+  for(int i=0;i<3;i++){
+    int row=clipMenu.scroll+i;if(row>=clipMenu.rows(clipCount))break;
+    int y=31+i*11;
+    if(row==clipMenu.selection){screen.fillRect(2,y-1,124,11,SSD1306_WHITE);screen.setTextColor(SSD1306_BLACK);}
+    else screen.setTextColor(SSD1306_WHITE);
+    int clip=clipMenu.clipAtRow(row,clipCount);
+    if(clip>=0&&clip==clipPos){screen.setCursor(2,y);screen.print(">");screen.setCursor(11,y);}
+    else screen.setCursor(6,y);
+    if(clipMenu.active<0){screen.print(clipMenu.names[clipMenu.folderAtRootRow(row)]);screen.println("/");}
+    else if(row==0)screen.println("< BACK");
+    else if(clip>=0)screen.println(clipNames[clip]);
+  }
+  screen.setTextColor(SSD1306_WHITE);
+}
+
+void activateClipMenuSelection(){
+  int clip=clipMenu.select(clipCount);
+  if(clip>=0){
+    if(clip==clipPos){isPlaying=!isPlaying;LED_ON[LED_7]=isPlaying;sendVideoCommand(isPlaying?"PLAY":"PAUSE");}
+    else{isPlaying=true;LED_ON[LED_7]=true;char command[16];snprintf(command,sizeof(command),"PLAY:%d",clip);sendVideoCommand(command);}
+  }
+  videoDisplayUpdated=false;
+}
+
+void drawLineInHeading() {
+  displays[8].setTextSize(1);
+  displays[8].setTextColor(SSD1306_WHITE);
+  displays[8].setCursor(2, 1);
+  displays[8].print("LINE IN");
+  // The live FPS badge clears x=107..127 on every display flush.
+  displays[8].setCursor(76, 1);
+  displays[8].print(autoeyez::lineInGain(function_value[8]), 1);
+  displays[8].print('x');
 }
 
 // Draw display 8 as it looks on a given page — for seamless page select preview
@@ -806,69 +1324,55 @@ void previewPageDisplay8(int p) {
 
   if (p == 0) {
     // Page 0: LINE IN header + volume bar (same as updateVolumeDisplay)
-    displays[8].setTextSize(1) ;
-    displays[8].getTextBounds("LINE IN", 0, 0, &x1, &y1, &w, &h) ;
-    displays[8].setCursor((128 - w) / 2, 1) ; displays[8].println("LINE IN") ;
-    int barFill = map(map(function_value[8], 0, 127, 0, 32), 0, 32, 0, 122) ;
+    drawLineInHeading();
+    int barFill = map(function_value[8], 0, 127, 0, 122) ;
     displays[8].drawRect(2, 11, 124, 8, SSD1306_WHITE) ;
     if (barFill > 0) { displays[8].fillRect(3, 12, barFill, 6, SSD1306_WHITE) ; }
   } else if (p == 1) {
     // Page 1: VIDEO OUT header + now playing
     displays[8].setTextSize(1) ;
-    displays[8].getTextBounds("VIDEO OUT", 0, 0, &x1, &y1, &w, &h) ;
-    displays[8].setCursor((128 - w) / 2, 1) ; displays[8].println("VIDEO OUT") ;
+    const char* heading=clipMenu.active<0?"VIDEO OUT":clipMenu.names[clipMenu.active];
+    displays[8].getTextBounds(heading, 0, 0, &x1, &y1, &w, &h) ;
+    displays[8].setCursor((128 - w) / 2, 1) ; displays[8].println(heading) ;
     displays[8].getTextBounds(nowPlaying, 0, 0, &x1, &y1, &w, &h) ;
     displays[8].setCursor(constrain((128 - w) / 2, 2, 128), 10) ; displays[8].println(nowPlaying) ;
     // play/pause icon
     if (isPlaying) { displays[8].fillTriangle(2, 19, 2, 27, 9, 23, SSD1306_WHITE) ; }
     else { displays[8].fillRect(2, 19, 3, 9, SSD1306_WHITE) ; displays[8].fillRect(7, 19, 3, 9, SSD1306_WHITE) ; }
     displays[8].drawFastHLine(2, 29, 124, SSD1306_WHITE) ;
-    // clip list
-    for (int i = 0 ; i < 3 ; i++) {
-      int idx = menuScroll + i ;
-      if (idx >= clipCount) break ;
-      int yPos = 31 + (i * 11) ;
-      if (idx == menuSelection) { displays[8].fillRect(2, yPos - 1, 124, 11, SSD1306_WHITE) ; displays[8].setTextColor(SSD1306_BLACK) ; }
-      else { displays[8].setTextColor(SSD1306_WHITE) ; }
-      if (idx == clipPos) { displays[8].setCursor(2, yPos) ; displays[8].print(">") ; displays[8].setCursor(11, yPos) ; }
-      else { displays[8].setCursor(6, yPos) ; }
-      displays[8].println(clipNames[idx]) ;
-    }
-    displays[8].setTextColor(SSD1306_WHITE) ;
+    drawClipMenuRows();
   } else if (p == 2) {
     // Page 2: mixer display
     drawMixerDisplay8Content() ;
   }
-  displays[8].display() ;
+  flushDisplay(8) ;
 }
 
 void drawPatchDisplay() {
   displays[5].clearDisplay() ;
-  displays[5].setTextColor(SSD1306_WHITE) ;
-  displays[5].setTextSize(1) ;
+  drawMenuHeader(5, "VIDEO PATCHES") ;
   int16_t x1, y1 ; uint16_t w, h ;
-  displays[5].getTextBounds("VIDEO PATCHES", 0, 0, &x1, &y1, &w, &h) ;
-  displays[5].setCursor((128 - w) / 2, 1) ;
-  displays[5].println("VIDEO PATCHES") ;
-  displays[5].drawFastHLine(2, 10, 124, SSD1306_WHITE) ;
 
+  if(patchLoadPending && patchTransactionOperation[0]=='V'){
+    displays[5].setTextSize(2);displays[5].setCursor(20,26);displays[5].println((recallQueueFullAt && millis()-recallQueueFullAt<1000)?"BUSY":patchTransactionUncertain?"WAIT":(strcmp(patchTransactionOperation+1,"SAVE")==0?"SAVING":"LOADING"));flushDisplay(5);page2Updated[P2_PATCH]=true;return;
+  }
   if (patchFlashActive) {
-    const char* msg = patchFlashSaved ? "SAVED!" : "LOADED!" ;
+    const char* msg = patchFlashError ? "ERR" : (patchFlashSaved ? "SAVED!" : "LOADED!") ;
     displays[5].setTextSize(2) ;
     displays[5].getTextBounds(msg, 0, 0, &x1, &y1, &w, &h) ;
     displays[5].setCursor((128 - w) / 2, 26) ;
     displays[5].println(msg) ;
-    displays[5].display() ;
+    flushDisplay(5) ;
     page2Updated[P2_PATCH] = true ;
     return ;
   }
 
-  for (int i = 0 ; i < 3 ; i++) {
+  for (int i = 0 ; i < MENU_VISIBLE_ROWS ; i++) {
     int idx  = patchScroll + i ;
     if (idx >= 32) break ;
-    int yPos = 13 + (i * 9) ;
+    int yPos = menuRowY(i) ;
     if (idx == patchCursor) {
-      displays[5].fillRect(2, yPos - 1, 124, 9, SSD1306_WHITE) ;
+      displays[5].fillRect(2, yPos - 1, 124, 11, SSD1306_WHITE) ;
       displays[5].setTextColor(SSD1306_BLACK) ;
     } else {
       displays[5].setTextColor(SSD1306_WHITE) ;
@@ -881,40 +1385,35 @@ void drawPatchDisplay() {
     displays[5].println(patchNames[idx]) ;
   }
   displays[5].setTextColor(SSD1306_WHITE) ;
-  displays[5].drawFastHLine(2, 44, 124, SSD1306_WHITE) ;
-  displays[5].setCursor(2, 47) ;
-  displays[5].println("HOLD=SAVE  TAP=LOAD") ;
-  displays[5].display() ;
+  flushDisplay(5) ;
   page2Updated[P2_PATCH] = true ;
 }
 
 void drawAudioPatchDisplay() {
   displays[6].clearDisplay() ;
-  displays[6].setTextColor(SSD1306_WHITE) ;
-  displays[6].setTextSize(1) ;
+  drawMenuHeader(6, "AUDIO PATCHES") ;
   int16_t x1, y1 ; uint16_t w, h ;
-  displays[6].getTextBounds("AUDIO PATCHES", 0, 0, &x1, &y1, &w, &h) ;
-  displays[6].setCursor((128 - w) / 2, 1) ;
-  displays[6].println("AUDIO PATCHES") ;
-  displays[6].drawFastHLine(2, 10, 124, SSD1306_WHITE) ;
 
+  if(patchLoadPending && patchTransactionOperation[0]=='A'){
+    displays[6].setTextSize(2);displays[6].setCursor(20,26);displays[6].println((recallQueueFullAt && millis()-recallQueueFullAt<1000)?"BUSY":patchTransactionUncertain?"WAIT":(strcmp(patchTransactionOperation+1,"SAVE")==0?"SAVING":"LOADING"));flushDisplay(6);page2Updated[P2_AUDIO]=true;return;
+  }
   if (audioPatchFlashActive) {
-    const char* msg = audioPatchFlashSaved ? "SAVED!" : "LOADED!" ;
+    const char* msg = audioPatchFlashError ? "ERR" : (audioPatchFlashSaved ? "SAVED!" : "LOADED!") ;
     displays[6].setTextSize(2) ;
     displays[6].getTextBounds(msg, 0, 0, &x1, &y1, &w, &h) ;
     displays[6].setCursor((128 - w) / 2, 26) ;
     displays[6].println(msg) ;
-    displays[6].display() ;
+    flushDisplay(6) ;
     page2Updated[P2_AUDIO] = true ;
     return ;
   }
 
-  for (int i = 0 ; i < 3 ; i++) {
+  for (int i = 0 ; i < MENU_VISIBLE_ROWS ; i++) {
     int idx = audioPatchScroll + i ;
     if (idx >= 32) break ;
-    int yPos = 13 + (i * 9) ;
+    int yPos = menuRowY(i) ;
     if (idx == audioPatchCursor) {
-      displays[6].fillRect(2, yPos - 1, 124, 9, SSD1306_WHITE) ;
+      displays[6].fillRect(2, yPos - 1, 124, 11, SSD1306_WHITE) ;
       displays[6].setTextColor(SSD1306_BLACK) ;
     } else {
       displays[6].setTextColor(SSD1306_WHITE) ;
@@ -927,11 +1426,64 @@ void drawAudioPatchDisplay() {
     displays[6].println(audioPatchNames[idx]) ;
   }
   displays[6].setTextColor(SSD1306_WHITE) ;
-  displays[6].drawFastHLine(2, 44, 124, SSD1306_WHITE) ;
-  displays[6].setCursor(2, 47) ;
-  displays[6].println("HOLD=SAVE  TAP=LOAD") ;
-  displays[6].display() ;
+  flushDisplay(6) ;
   page2Updated[P2_AUDIO] = true ;
+}
+
+void drawMoshDisplay() {
+  displays[7].clearDisplay() ;
+  displays[7].setTextColor(SSD1306_WHITE) ;
+  int16_t x1, y1 ; uint16_t w, h ;
+
+  const int values[ENC7_MODE_COUNT] = { moshValue, chromaValue, crushValue, pixelValue,
+    react_band < 0 ? bleedValue : processingReactiveValues[react_band][0],
+    react_band < 0 ? alignValue : processingReactiveValues[react_band][1],
+    react_band < 0 ? ghostValue : processingReactiveValues[react_band][2],
+    react_band < 0 ? wobbleValue : processingReactiveValues[react_band][3],
+    react_band < 0 ? overdriveValue : processingReactiveValues[react_band][4],
+    react_band < 0 ? holdValue : holdReactiveValues[react_band] } ;
+  if (!postFxEditing) {
+    drawMenuHeader(7, react_band < 0 ? "PROCESSING" :
+        react_band == 0 ? "PROCESS LOW" : react_band == 1 ? "PROCESS MID" : "PROCESS HIGH") ;
+    for (int i = 0 ; i < MENU_VISIBLE_ROWS ; i++) {
+      int idx = postFxScroll + i ;
+      if (idx >= ENC7_MODE_COUNT) break ;
+      int yPos = menuRowY(i) ;
+      if (idx == enc7Mode) {
+        displays[7].fillRect(2, yPos - 1, 124, 11, SSD1306_WHITE) ;
+        displays[7].setTextColor(SSD1306_BLACK) ;
+      } else displays[7].setTextColor(SSD1306_WHITE) ;
+      displays[7].setCursor(6, yPos) ;
+      displays[7].print(enc7ModeLabels[idx]) ;
+      char valueBuf[16] ;
+      snprintf(valueBuf, sizeof(valueBuf), "%d%%", values[idx] * 100 / 127) ;
+      displays[7].getTextBounds(valueBuf, 0, 0, &x1, &y1, &w, &h) ;
+      displays[7].setCursor(122 - w, yPos) ;
+      displays[7].print(valueBuf) ;
+    }
+  } else {
+    int currentValue = values[enc7Mode] ;
+    const char* label = enc7ModeLabels[enc7Mode] ;
+    displays[7].setTextSize(2) ;
+    displays[7].getTextBounds(label, 0, 0, &x1, &y1, &w, &h) ;
+    displays[7].setCursor((128 - w) / 2, 0) ;
+    displays[7].println(label) ;
+    int val = constrain(currentValue, 0, 126) ;
+    displays[7].fillRect(1, 26, val, 12, SSD1306_WHITE) ;
+    displays[7].drawLine(1, 23, 1, 40, SSD1306_WHITE) ;
+    displays[7].drawLine(126, 23, 126, 40, SSD1306_WHITE) ;
+    displays[7].drawLine(1, 32, 126, 32, SSD1306_WHITE) ;
+    displays[7].drawFastHLine(2, 45, 124, SSD1306_WHITE) ;
+    displays[7].setTextSize(1) ;
+    char valueBuf[32] ;
+    snprintf(valueBuf, sizeof(valueBuf), "%d%%  PUSH FOR LIST", currentValue * 100 / 127) ;
+    displays[7].getTextBounds(valueBuf, 0, 0, &x1, &y1, &w, &h) ;
+    displays[7].setCursor((128 - w) / 2, 49) ;
+    displays[7].println(valueBuf) ;
+  }
+  displays[7].setTextColor(SSD1306_WHITE) ;
+  flushDisplay(7) ;
+  page2Updated[P2_MOSH] = true ;
 }
 
 // ============================================================
@@ -943,8 +1495,9 @@ void drawVideoDisplay() {
   displays[8].setTextSize(1) ;
   displays[8].setTextColor(SSD1306_WHITE) ;
   int16_t x1, y1 ; uint16_t w, h ;
-  displays[8].getTextBounds("VIDEO OUT", 0, 0, &x1, &y1, &w, &h) ;
-  displays[8].setCursor((128 - w) / 2, 1) ; displays[8].println("VIDEO OUT") ;
+  const char* heading=clipMenu.active<0?"VIDEO OUT":clipMenu.names[clipMenu.active];
+  displays[8].getTextBounds(heading, 0, 0, &x1, &y1, &w, &h) ;
+  displays[8].setCursor((128 - w) / 2, 1) ; displays[8].println(heading) ;
   displays[8].getTextBounds(nowPlaying, 0, 0, &x1, &y1, &w, &h) ;
   displays[8].setCursor(constrain((128 - w) / 2, 2, 128), 10) ; displays[8].println(nowPlaying) ;
   if (isPlaying) { displays[8].fillTriangle(2, 19, 2, 27, 9, 23, SSD1306_WHITE) ; }
@@ -964,18 +1517,8 @@ void drawVideoDisplay() {
     if (fillW > 0) displays[8].fillRect(barLeft + 1, 21, fillW, 6, SSD1306_WHITE) ;
   }
   displays[8].drawFastHLine(2, 29, 124, SSD1306_WHITE) ;
-  for (int i = 0 ; i < 3 ; i++) {
-    int idx = menuScroll + i ;
-    if (idx >= clipCount) break ;
-    int yPos = 31 + (i * 11) ;
-    if (idx == menuSelection) { displays[8].fillRect(2, yPos - 1, 124, 11, SSD1306_WHITE) ; displays[8].setTextColor(SSD1306_BLACK) ; }
-    else { displays[8].setTextColor(SSD1306_WHITE) ; }
-    if (idx == clipPos) { displays[8].setCursor(2, yPos) ; displays[8].print(">") ; displays[8].setCursor(11, yPos) ; }
-    else { displays[8].setCursor(6, yPos) ; }
-    displays[8].println(clipNames[idx]) ;
-  }
-  displays[8].setTextColor(SSD1306_WHITE) ;
-  displays[8].display() ;
+  drawClipMenuRows();
+  flushDisplay(8) ;
   videoDisplayUpdated = true ;
 }
 
@@ -985,35 +1528,137 @@ void drawVideoDisplay() {
 
 void updateVolumeDisplay() {
   displays[8].fillRect(2, 0, 124, 22, SSD1306_BLACK) ;
-  displays[8].setTextSize(1) ; displays[8].setTextColor(SSD1306_WHITE) ;
-  int16_t x1, y1 ; uint16_t w, h ;
-  displays[8].getTextBounds("LINE IN", 0, 0, &x1, &y1, &w, &h) ;
-  displays[8].setCursor((128 - w) / 2, 1) ; displays[8].println("LINE IN") ;
-  int barFill = map(map(function_value[8], 0, 127, 0, 32), 0, 32, 0, 122) ;
+  drawLineInHeading();
+  int barFill = map(function_value[8], 0, 127, 0, 122) ;
   displays[8].drawRect(2, 11, 124, 8, SSD1306_WHITE) ;
   if (barFill > 0) { displays[8].fillRect(3, 12, barFill, 6, SSD1306_WHITE) ; }
-  displays[8].display() ;
+  flushDisplay(8) ;
 }
 
 void drawSpectrum() {
-  if (page == 0 && !enc8HeldLong && pendingPage < 0) {
-    if (fft.available()) {
+  if (page == 0 && !enc8HeldLong && pendingPage < 0 && !shaderOverlayActive) {
+    if (spectrumGeneration != fftSnapshot.generation) {
+      spectrumGeneration=fftSnapshot.generation;
       displays[8].fillRect(0, 22, 128, 42, SSD1306_BLACK) ;
-      unsigned long now = millis() ;
-      for (int i = 0 ; i < 32 ; i++) {
-        float level = fft.read((i * 4) + 1) ;
-        level *= 1.0f + (float)i * 0.18f ;
-        level *= map(function_value[8], 0, 127, 0, 32) / 25.0f ;
-        smoothedLevels[i] += (level - smoothedLevels[i]) * (level > smoothedLevels[i] ? ATTACK : DECAY) ;
-        if (smoothedLevels[i] >= peakLevels[i]) { peakLevels[i] = smoothedLevels[i] ; peakHoldStart[i] = now ; }
-        else if (now - peakHoldStart[i] > PEAK_HOLD_MS) { peakLevels[i] = max(0.0f, peakLevels[i] - PEAK_DECAY) ; }
-        int barHeight  = constrain((int)(smoothedLevels[i] * 38 * 8), 0, 38) ;
-        int peakHeight = constrain((int)(peakLevels[i]    * 38 * 8), 0, 38) ;
-        if (barHeight > 0) { displays[8].fillRect(1 + i * 4, 63 - barHeight, 3, barHeight, SSD1306_WHITE) ; }
-        if (peakHeight > barHeight && peakHeight > 0) { displays[8].drawFastHLine(1 + i * 4, 63 - peakHeight, 3, SSD1306_WHITE) ; }
+      spectrum.update([](unsigned bin) { return readControllerFft(bin); },
+                      autoeyez::lineInGain(function_value[8]), millis());
+      for (int i = 0; i < 32; ++i) {
+        const int barHeight = constrain((int)(spectrum.levels[i] * 32), 0, 32);
+        const int peakHeight = constrain((int)(spectrum.peaks[i] * 32), 0, 32);
+        if (barHeight > 0) displays[8].fillRect(1 + i * 4, 55 - barHeight, 3, barHeight, SSD1306_WHITE);
+        if (peakHeight > barHeight) displays[8].drawFastHLine(1 + i * 4, 55 - peakHeight, 3, SSD1306_WHITE);
       }
-      displays[8].display() ;
+      // Labels mark approximate bin centers, not equal-width frequency steps.
+      displays[8].setTextSize(1); displays[8].setTextColor(SSD1306_WHITE);
+      displays[8].setCursor(15, 56); displays[8].print("1k");
+      displays[8].setCursor(54, 56); displays[8].print("4k");
+      displays[8].setCursor(90, 56); displays[8].print("10k");
+      flushDisplay(8) ;
     }
+  }
+}
+
+// =============================================================================
+// PROCESS FFT BANDS AND SEND MIDI
+// =============================================================================
+// Calculates low/mid/high band energies from FFT and sends as MIDI CCs.
+// Uses asymmetric smoothing (fast attack, slow decay) for punchy response.
+// Gain controlled by encoder 8 (function_value[8]) — same as spectrum display.
+
+bool sendControllerFft(const char* message){
+  if(Serial.availableForWrite()<int(strlen(message)+2))return false;
+  Serial.println(message);return true;
+}
+
+void sendFftFrame(int low, int mid, int high,
+                  int extLow, int extMid, int extHigh) {
+  static uint8_t sequence = 0;
+  usbMIDI.sendControlChange(CC_BAND_LOW, low, 1);
+  usbMIDI.sendControlChange(CC_BAND_MID, mid, 1);
+  usbMIDI.sendControlChange(CC_BAND_HIGH, high, 1);
+  const int extended[3] = {extLow, extMid, extHigh};
+  for (int i = 0; i < 3; ++i) {
+    usbMIDI.sendControlChange(CC_BAND_EXT_FIRST + i * 2,
+                              extended[i] >> 7, 1);
+    usbMIDI.sendControlChange(CC_BAND_EXT_FIRST + i * 2 + 1,
+                              extended[i] & 0x7f, 1);
+  }
+  usbMIDI.sendControlChange(CC_BAND_FRAME, sequence++ & 0x7f, 1);
+  usbMIDI.send_now();
+#if FFT_SERIAL_COMPAT
+  char fftBuf[24];
+  snprintf(fftBuf, sizeof(fftBuf), "FFT:%d,%d,%d", low, mid, high);
+  sendControllerFft(fftBuf);
+#endif
+  lastBandLowCC = low;
+  lastBandMidCC = mid;
+  lastBandHighCC = high;
+  for (int i = 0; i < 3; ++i) lastBandExt[i] = extended[i];
+  lastBandSendTime = millis();
+}
+
+void processFftBands() {
+  // Band and spectrum consumers share the newest captured FFT frame.
+  // A 20ms change gate carries each available FFT snapshot; the 100ms
+  // unchanged-value heartbeat remains below.
+
+  // Get input gain multiplier from encoder 8 (line-in volume)
+  // Same scaling as drawSpectrum uses
+  float gain = autoeyez::lineInGain(function_value[8]);
+
+  // If gain is zero, zero out bands and send zeros (once)
+  if (gain < 0.01f) {
+    if (lastBandLowCC != 0 || lastBandMidCC != 0 || lastBandHighCC != 0 ||
+        lastBandExt[0] != 0 || lastBandExt[1] != 0 || lastBandExt[2] != 0) {
+      bandLow = bandMid = bandHigh = 0.0f ;
+      sendFftFrame(0, 0, 0, 0, 0, 0);
+    }
+    return ;
+  }
+
+  const auto bands = controllerBands(gain);
+  float rawLow = bands.low, rawMid = bands.mid, rawHigh = bands.high;
+
+  // Apply asymmetric smoothing (fast attack, slow decay)
+  float rateLow  = (rawLow  > bandLow)  ? bandAttackRate : bandDecayRate ;
+  float rateMid  = (rawMid  > bandMid)  ? bandAttackRate : bandDecayRate ;
+  float rateHigh = (rawHigh > bandHigh) ? bandAttackRate : bandDecayRate ;
+
+  bandLow  += (rawLow  - bandLow)  * rateLow ;
+  bandMid  += (rawMid  - bandMid)  * rateMid ;
+  bandHigh += (rawHigh - bandHigh) * rateHigh ;
+
+  // Clamp raw values to 0-1 range, then convert to MIDI CC values.
+  float clampedLow  = constrain(rawLow,  0.0f, 1.0f) ;
+  float clampedMid  = constrain(rawMid,  0.0f, 1.0f) ;
+  float clampedHigh = constrain(rawHigh, 0.0f, 1.0f) ;
+  int ccLow  = (int)(clampedLow  * 127.0f) ;
+  int ccMid  = (int)(clampedMid  * 127.0f) ;
+  int ccHigh = (int)(clampedHigh * 127.0f) ;
+  auto extended = [](float value) {
+    return int(constrain(value, 0.0f, BAND_EXT_MAX) *
+               (16383.0f / BAND_EXT_MAX) + 0.5f);
+  };
+  const int extLow = extended(rawLow), extMid = extended(rawMid),
+            extHigh = extended(rawHigh);
+
+  // Time-based rate limiting
+  unsigned long now = millis() ;
+  if (now - lastBandSendTime < BAND_SEND_INTERVAL_MS) return ;
+
+  // Send changed values promptly, with a heartbeat when values hold steady.
+  bool changed = (abs(ccLow - lastBandLowCC) > BAND_CC_THRESHOLD) ||
+                 (abs(ccMid - lastBandMidCC) > BAND_CC_THRESHOLD) ||
+                 (abs(ccHigh - lastBandHighCC) > BAND_CC_THRESHOLD) ||
+                 abs(extLow - lastBandExt[0]) > 1 ||
+                 abs(extMid - lastBandExt[1]) > 1 ||
+                 abs(extHigh - lastBandExt[2]) > 1 ;
+
+  if (changed) {
+    sendFftFrame(ccLow, ccMid, ccHigh, extLow, extMid, extHigh);
+  } else if (now - lastBandSendTime > 100) {
+    // Heartbeat: force send every 100ms even if unchanged
+    sendFftFrame(ccLow, ccMid, ccHigh, extLow, extMid, extHigh);
   }
 }
 
@@ -1022,12 +1667,22 @@ void drawSpectrum() {
 // ============================================================
 
 void initializeAllMidiControls() {
-  usbMIDI.sendControlChange(16, 64, 1) ; usbMIDI.send_now() ;
-  for(byte cc = 17 ; cc <= 127 ; cc++) {
-    usbMIDI.sendControlChange(cc, 63, 1) ;
-    if (cc % 8 == 0) { usbMIDI.send_now() ; delayMicroseconds(500) ; }
+  for (const auto& parameter : autoeyez::initialParameters) {
+    usbMIDI.sendControlChange(parameter.control, parameter.value, 1) ;
+    if (parameter.control == 16 || parameter.control % 8 == 0) {
+      usbMIDI.send_now() ; delayMicroseconds(500) ;
+    }
   }
   usbMIDI.send_now() ;
+}
+
+bool sendAudioPatchCommand(uint8_t control, int slot) {
+  if ((control != 92 && control != 93) || !autoeyez::validControllerAudioSlot(slot)) {
+    Serial.println("PATCH_ERROR:INVALID_AUDIO_SLOT") ;
+    return false ;
+  }
+  usbMIDI.sendControlChange(control, slot + 1, 1) ; usbMIDI.send_now() ;
+  return true ;
 }
 
 void sweepAndLatch() {
@@ -1046,7 +1701,15 @@ void sweepAndLatch() {
 }
 
 void scanPatches() {
-  AudioNoInterrupts() ;
+  for (int slot = 0 ; slot < 32 ; slot++) {
+    char finalName[24], backupName[24] ;
+    snprintf(finalName, sizeof(finalName), "/PATCH%02d.TXT", slot + 1) ;
+    snprintf(backupName, sizeof(backupName), "/PATCH%02d.BAK", slot + 1) ;
+    if (!autoeyez::recoverPatch(SD, finalName, backupName)) {
+      Serial.println("SD_ERROR:PATCH_RECOVERY") ;
+    }
+  }
+
   for (int i = 0 ; i < 32 ; i++) {
     snprintf(patchNames[i], 10, "PATCH %02d", i + 1) ;
     patchFilled[i] = false ;
@@ -1079,17 +1742,25 @@ void scanPatches() {
     }
   }
   root.close() ;
-  AudioInterrupts() ;
+
 }
 
 void scanAudioPatches() {
-  AudioNoInterrupts() ;
+  for (int slot = 0 ; slot < 32 ; slot++) {
+    char finalName[24], backupName[24] ;
+    snprintf(finalName, sizeof(finalName), "/AUDIO%02d.TXT", slot + 1) ;
+    snprintf(backupName, sizeof(backupName), "/AUDIO%02d.BAK", slot + 1) ;
+    if (!autoeyez::recoverPatch(SD, finalName, backupName)) {
+      Serial.println("SD_ERROR:AUDIO_RECOVERY") ;
+    }
+  }
+
   for (int i = 0 ; i < 32 ; i++) {
     snprintf(audioPatchNames[i], 10, "AUDIO %02d", i + 1) ;
     audioPatchFilled[i] = false ;
   }
   File root = SD.open("/") ;
-  if (!root) { AudioInterrupts() ; return ; }
+  if (!root) return ;
   while (true) {
     File f = root.openNextFile() ;
     if (!f) break ;
@@ -1107,7 +1778,7 @@ void scanAudioPatches() {
     audioPatchFilled[slot] = true ;
   }
   root.close() ;
-  AudioInterrupts() ;
+
 }
 
 /**
@@ -1117,44 +1788,86 @@ void scanAudioPatches() {
  *
  * @param slot Patch slot number (0-31)
  */
-void savePatch(int slot) {
-  AudioNoInterrupts() ;  // Pause audio during SD access
-  char fname[24] ;
-  snprintf(fname, 24, "/PATCH%02d.TXT", slot + 1) ;
-
-  // Remove existing file to ensure clean write
-  if (SD.exists(fname)) SD.remove(fname) ;
-  File f = SD.open(fname, FILE_WRITE) ;
-  if (!f) return ;
-
+bool savePatch(int slot) {
+  if (patchLoadPending || slot < 0 || slot >= 32) return false ;
+  char finalName[24], tempName[24], backupName[24] ;
+  snprintf(finalName, sizeof(finalName), "/PATCH%02d.TXT", slot + 1) ;
+  snprintf(tempName, sizeof(tempName), "/PATCH%02d.TMP", slot + 1) ;
+  snprintf(backupName, sizeof(backupName), "/PATCH%02d.BAK", slot + 1) ;
+  char data[1536] ;
+  size_t used = 0 ;
+  bool dataOK = true ;
+  auto append = [&](const char* key, int value) {
+    if (!autoeyez::appendPatchLine(data, sizeof(data), used, key, value)) dataOK = false ;
+  } ;
+  append("patchVersion",4);append("slot",slot);
   // Save encoder values (18 parameters across 2 pages)
-  for (int i = 0 ; i < 18 ; i++) { f.print("enc") ; f.print(i) ; f.print("=") ; f.println(function_value[i]) ; }
+  for (int i = 0 ; i < 18 ; i++) { char key[12] ; snprintf(key, sizeof(key), "enc%d", i) ; append(key, function_value[i]) ; }
 
   // Save toggle states (8 on/off controls)
-  for (int i = 0 ; i < 8 ; i++)  { f.print("ctrl") ; f.print(i) ; f.print("=") ; f.println(control[i] ? 1 : 0) ; }
+  for (int i = 0 ; i < 8 ; i++)  { char key[12] ; snprintf(key, sizeof(key), "ctrl%d", i) ; append(key, control[i] ? 1 : 0) ; }
 
   // Save function multiplier states (8 encoders × 4 levels each)
-  for (int i = 0 ; i < 8 ; i++)  { f.print("func") ; f.print(i) ; f.print("=") ; f.println(function[i]) ; }
-  f.print("react=")     ; f.println(react_band) ;
-  f.print("lumaKey=")   ; f.println(lumaKeyValue) ;
-  f.print("lumaHigh=")  ; f.println(lumaHighValue) ;
-  f.print("lumaLowEn=") ; f.println(lumaLowEnabled ? 1 : 0) ;
-  f.print("lumaHiEn=")  ; f.println(lumaHighEnabled ? 1 : 0) ;
-  f.print("mix=")       ; f.println(mixValue) ;
-  f.print("chA=")       ; f.println(chASource) ;
-  f.print("chB=")       ; f.println(chBSource) ;
-  f.print("lumaSrc=")   ; f.println(lumaSourceSel) ;
-  f.print("mixMode=")   ; f.println(mixerSubMode) ;
-  f.print("clip=")      ; f.println(clipPos) ;
-  f.print("loop=")      ; f.println(isLooping ? 1 : 0) ;
-  f.print("srcHue=")    ; f.println(srcHue) ;
-  f.print("srcSat=")    ; f.println(srcSat) ;
-  f.print("srcVal=")    ; f.println(srcVal) ;
-  f.print("srcShader=") ; f.println(srcShader) ;
-  f.close() ;
-  patchFilled[slot] = true ;
-  snprintf(patchNames[slot], 10, "PATCH %02d", slot + 1) ;
-  AudioInterrupts() ;
+  for (int i = 0 ; i < 8 ; i++)  { char key[12] ; snprintf(key, sizeof(key), "func%d", i) ; append(key, function[i]) ; }
+  append("react", react_band) ;
+  append("lumaKey", lumaKeyValue) ;
+  append("lumaHigh", lumaHighValue) ;
+  append("lumaLowEn", lumaLowEnabled ? 1 : 0) ;
+  append("lumaHiEn", lumaHighEnabled ? 1 : 0) ;
+  append("renderVersion", 1);
+  append("renderLumaInvert", rendererLumaInvert ? 1 : 0);
+  append("renderMirror", rendererMirror ? 1 : 0);
+  append("mix", mixValue) ;
+  append("chA", chASource) ;
+  append("chB", chBSource) ;
+  append("lumaSrc", lumaSourceSel) ;
+  append("lumaTrack", lumaTrackEnabled ? 1 : 0) ;
+  append("mixMode", mixerSubMode) ;
+  append("clip", clipPos) ;
+  append("loop", isLooping ? 1 : 0) ;
+  append("srcHue", srcHue) ;
+  append("srcSat", srcSat) ;
+  append("srcVal", srcVal) ;
+  append("srcShader", srcShader) ;
+  append("mosh", moshValue) ;
+  append("chroma", chromaValue) ;
+  append("crush", crushValue) ;
+  append("pixel", pixelValue) ;
+  append("bleed", bleedValue) ;
+  append("align", alignValue) ;
+  append("ghost", ghostValue) ;
+  append("wobble", wobbleValue) ;
+  append("overdrive", overdriveValue) ;
+  append("hold", holdValue) ;
+  append("houseCard", houseCardEnabled ? 1 : 0) ;
+  append("houseLogo", houseLogoEnabled ? 1 : 0) ;
+  append("mainLogo", annLogoEnabled ? 1 : 0) ;
+  if (!dataOK) { Serial.println("SD_ERROR:PATCH_TOO_LARGE") ; return false ; }
+  autoeyez::VideoPatch snapshot;
+  char parsed[1536];memcpy(parsed,data,used);parsed[used]=0;
+  for(char* line=strtok(parsed,"\r\n");line;line=strtok(nullptr,"\r\n"))if(!snapshot.line(line)){Serial.println("PATCH_ERROR:INVALID_SNAPSHOT");return false;}
+  if(!snapshot.finish(slot)){Serial.println("PATCH_ERROR:INCOMPLETE_SNAPSHOT");return false;}
+  patchSaveHadPrevious=SD.exists(finalName);
+  beginPatchTransaction("VSAVE",slot,&snapshot);
+  if(!recordPendingSave(data,used)){patchLoadPending=false;return false;}
+  const auto result = autoeyez::saveVerifiedPatch(SD, finalName, tempName, backupName,
+                                                 data, used, FILE_WRITE) ;
+  if (result != autoeyez::SaveResult::Saved) {
+    Serial.print("SD_ERROR:PATCH_SAVE:") ; Serial.println(static_cast<int>(result)) ;
+    patchLoadPending=false;erasePatchJournal();return false ;
+  }
+  return true;
+}
+
+bool saveAudioMarker(int slot) {
+  if (slot < 0 || slot >= 32) return false ;
+  char finalName[24], tempName[24], backupName[24] ;
+  snprintf(finalName, sizeof(finalName), "/AUDIO%02d.TXT", slot + 1) ;
+  snprintf(tempName, sizeof(tempName), "/AUDIO%02d.TMP", slot + 1) ;
+  snprintf(backupName, sizeof(backupName), "/AUDIO%02d.BAK", slot + 1) ;
+  const char marker[] = "marker=1\r\n" ;
+  return autoeyez::saveVerifiedPatch(SD, finalName, tempName, backupName,
+                                    marker, sizeof(marker)-1, FILE_WRITE) == autoeyez::SaveResult::Saved ;
 }
 
 /**
@@ -1166,132 +1879,186 @@ void savePatch(int slot) {
  * @param slot Patch slot number (0-31)
  */
 void loadPatch(int slot) {
-  char fname[24] ;
-  snprintf(fname, 24, "/PATCH%02d.TXT", slot + 1) ;
-  AudioNoInterrupts() ;  // Pause audio during SD access
-
-  if (!SD.exists(fname)) { AudioInterrupts() ; return ; }
-  File f = SD.open(fname) ;
-  if (!f) { AudioInterrupts() ; return ; }
-
-  // Parse each line of the patch file
-  while (f.available()) {
-    char line[32] ;
-    int len = 0 ;
-    while (f.available() && len < 31) {
-      char c = f.read() ;
-      if (c == '\n') break ;
-      if (c != '\r') line[len++] = c ;
-    }
-    line[len] = '\0' ;
-    char* eq = strchr(line, '=') ;
-    if (!eq) continue ;
-    *eq = '\0' ;
-    char* key = line ;
-    int val = atoi(eq + 1) ;
-    if (strncmp(key, "enc", 3) == 0) {
-      int i = atoi(key + 3) ;
-      if (i >= 0 && i < 18) function_value[i] = val ;
-    } else if (strncmp(key, "ctrl", 4) == 0) {
-      int i = atoi(key + 4) ;
-      if (i >= 0 && i < 8) control[i] = (bool)val ;
-    } else if (strncmp(key, "func", 4) == 0) {
-      int i = atoi(key + 4) ;
-      if (i >= 0 && i < 8) function[i] = val ;
-    }
-    else if (strcmp(key, "react") == 0)     { react_band      = val ; }
-    else if (strcmp(key, "lumaKey") == 0)   { lumaKeyValue     = val ; }
-    else if (strcmp(key, "lumaHigh") == 0)  { lumaHighValue    = val ; }
-    else if (strcmp(key, "lumaLowEn") == 0) { lumaLowEnabled   = (bool)val ; }
-    else if (strcmp(key, "lumaHiEn") == 0)  { lumaHighEnabled  = (bool)val ; }
-    else if (strcmp(key, "mix") == 0)       { mixValue         = val ; mixValueSmoothed = val ; }
-    else if (strcmp(key, "chA") == 0)       { chASource        = val ; chASelection = val ; }
-    else if (strcmp(key, "chB") == 0)       { chBSource        = val ; chBSelection = val ; }
-    else if (strcmp(key, "lumaSrc") == 0)   { lumaSourceSel    = val ; lumaSourceCursor = val ; }
-    else if (strcmp(key, "mixMode") == 0)   { mixerSubMode     = val ; }
-    else if (strcmp(key, "clip") == 0)      { clipPos          = val ; }
-    else if (strcmp(key, "loop") == 0)      { isLooping = (bool)val ; }
-    else if (strcmp(key, "srcHue") == 0)    { srcHue           = val ; }
-    else if (strcmp(key, "srcSat") == 0)    { srcSat           = val ; }
-    else if (strcmp(key, "srcVal") == 0)    { srcVal           = val ; }
-    else if (strcmp(key, "srcShader") == 0) { srcShader        = val ; }
+  if(slot<0||slot>=32)return;
+  if(patchLoadPending){if(!queuedRecalls.push(false,slot)){recallQueueFullAt=millis();Serial.println("PATCH_ERROR:RECALL_QUEUE_FULL");page2Updated[P2_PATCH]=false;}return;}
+  char fname[24],backup[24];snprintf(fname,sizeof(fname),"/PATCH%02d.TXT",slot+1);snprintf(backup,sizeof(backup),"/PATCH%02d.BAK",slot+1);
+  bool valid=autoeyez::recoverPatch(SD,fname,backup);File file=SD.open(fname);
+  autoeyez::VideoPatch snapshot;char line[64];size_t used=0;
+  if(!file||file.size()>1535)valid=false;
+  while(valid && file.available()){
+    char c=file.read();
+    if(c=='\n') {line[used]=0;if(used && !snapshot.line(line))valid=false;used=0;}
+    else if(c=='\r'){if(file.available()&&file.peek()!='\n'){valid=false;break;}}
+    else {if(used>=sizeof(line)-1){valid=false;break;}line[used++]=c;}
   }
-  f.close() ;
-  AudioInterrupts() ;
-  char cmdBuf[24] ;
-  snprintf(cmdBuf, 24, "LUMA:%d",         lumaLowEnabled ? lumaKeyValue : 0) ; queueVideoCommand(cmdBuf) ;
-  snprintf(cmdBuf, 24, "LUMA_HIGH:%d",    lumaHighValue) ;                     queueVideoCommand(cmdBuf) ;
-  snprintf(cmdBuf, 24, "LUMA_HIGH_EN:%d", lumaHighEnabled ? 1 : 0) ;           queueVideoCommand(cmdBuf) ;
-  snprintf(cmdBuf, 24, "LUMA_SRC:%d",     lumaSourceSel) ;                     queueVideoCommand(cmdBuf) ;
-  snprintf(cmdBuf, 24, "MIX:%d",          mixValue) ;                          queueVideoCommand(cmdBuf) ;
-  snprintf(cmdBuf, 24, "CH_A:%d",         chASource) ;                         queueVideoCommand(cmdBuf) ;
-  snprintf(cmdBuf, 24, "CH_B:%d",         chBSource) ;                         queueVideoCommand(cmdBuf) ;
-  queueVideoCommand(isLooping ? "LOOP_ON" : "LOOP_OFF") ;
-  snprintf(cmdBuf, 24, "PLAY:%d",         clipPos) ;                           queueVideoCommand(cmdBuf) ;
-  patchLoadPending = true ;
-  patchLoadStep    = 0 ;
-  patchLoadTimer   = millis() ;
+  line[used]=0;if(used && !snapshot.line(line))valid=false;file.close();
+  if(!valid||!snapshot.finish(slot)){
+    Serial.println("PATCH_ERROR:INVALID_FILE");patchFlashActive=true;patchFlashSaved=false;patchFlashError=true;patchFlashTimer=millis();page2Updated[P2_PATCH]=false;return;
+  }
+  beginPatchTransaction("VLOAD",slot,&snapshot);
 }
 
-void executePatchLoad() {
-  if (!patchLoadPending) return ;
-  if (millis() - patchLoadTimer < 20) return ;
-  patchLoadTimer = millis() ;
+// One-time remote recovery path. Keep the original .BAK and a second .RCV
+// copy; move the reset-era .TXT to .BAD only after the replacement is verified.
+void restorePatchBackup(int slot) {
+  if (slot < 0 || slot >= 32 || patchLoadPending) {
+    Serial.println("PATCH_BACKUP_ERROR:BUSY_OR_SLOT") ; return ;
+  }
+  char finalName[24], backupName[24], safetyName[24], tempName[24], badName[24] ;
+  snprintf(finalName,sizeof(finalName),"/PATCH%02d.TXT",slot+1) ;
+  snprintf(backupName,sizeof(backupName),"/PATCH%02d.BAK",slot+1) ;
+  snprintf(safetyName,sizeof(safetyName),"/PATCH%02d.RCV",slot+1) ;
+  snprintf(tempName,sizeof(tempName),"/PATCH%02d.TMP",slot+1) ;
+  snprintf(badName,sizeof(badName),"/PATCH%02d.BAD",slot+1) ;
+  File backup=SD.open(backupName) ;
+  char data[1536] ;
+  const size_t length=backup ? backup.size() : 0 ;
+  if (!backup || !length || length >= sizeof(data) ||
+      backup.read(reinterpret_cast<uint8_t*>(data),length) != int(length)) {
+    backup.close() ; Serial.println("PATCH_BACKUP_ERROR:READ") ; return ;
+  }
+  backup.close() ;
+  autoeyez::VideoPatch snapshot ;
+  char parsed[1536] ; memcpy(parsed,data,length) ; parsed[length]=0 ;
+  bool valid=true ;
+  for (char* line=strtok(parsed,"\r\n");line;line=strtok(nullptr,"\r\n"))
+    if (!snapshot.line(line)) { valid=false ; break ; }
+  if (!valid || !snapshot.finish(slot)) {
+    Serial.println("PATCH_BACKUP_ERROR:INVALID_PATCH") ; return ;
+  }
+  if (SD.exists(badName)) {
+    Serial.println("PATCH_BACKUP_ERROR:BAD_COPY_EXISTS") ; return ;
+  }
+  if (SD.exists(safetyName)) {
+    if (!autoeyez::verifyPatch(SD,safetyName,data,length)) {
+      Serial.println("PATCH_BACKUP_ERROR:SAFETY_COPY_MISMATCH") ; return ;
+    }
+  } else {
+    File safety=SD.open(safetyName,FILE_WRITE) ;
+    const bool written=safety && safety.write(reinterpret_cast<const uint8_t*>(data),length)==length ;
+    if (safety) { safety.flush() ; safety.close() ; }
+    if (!written || !autoeyez::verifyPatch(SD,safetyName,data,length)) {
+      Serial.println("PATCH_BACKUP_ERROR:SAFETY_COPY") ; return ;
+    }
+  }
+  if (SD.exists(tempName) && !SD.remove(tempName)) {
+    Serial.println("PATCH_BACKUP_ERROR:TEMP_REMOVE") ; return ;
+  }
+  File temp=SD.open(tempName,FILE_WRITE) ;
+  const bool written=temp && temp.write(reinterpret_cast<const uint8_t*>(data),length)==length ;
+  if (temp) { temp.flush() ; temp.close() ; }
+  if (!written || !autoeyez::verifyPatch(SD,tempName,data,length)) {
+    Serial.println("PATCH_BACKUP_ERROR:TEMP_VERIFY") ; return ;
+  }
+  if (!SD.exists(finalName) || !SD.rename(finalName,badName)) {
+    Serial.println("PATCH_BACKUP_ERROR:CURRENT_RENAME") ; return ;
+  }
+  if (!SD.rename(tempName,finalName) ||
+      !autoeyez::verifyPatch(SD,finalName,data,length)) {
+    if (SD.exists(finalName)) SD.remove(finalName) ;
+    if (!SD.rename(badName,finalName))
+      Serial.println("PATCH_BACKUP_ERROR:ROLLBACK_FAILED") ;
+    else Serial.println("PATCH_BACKUP_ERROR:RESTORE_FAILED") ;
+    return ;
+  }
+  Serial.print("PATCH_BACKUP_RESTORED:") ; Serial.println(slot+1) ;
+  loadPatch(slot) ;
+}
 
-  if (patchLoadStep == 0) {
-    Serial.println("PATCH: CC91 HIGH") ;
-    usbMIDI.sendControlChange(91, 127, 1) ; usbMIDI.send_now() ;
-    patchLoadStep++ ; return ;
+void beginPatchTransaction(const char* operation,int slot,const autoeyez::VideoPatch* patch){
+  if(patchLoadPending)return;
+  static uint32_t sequence=0;
+  static const uint32_t bootNonce=ARM_DWT_CYCCNT ^ micros() ^ uint32_t(random(1,2147483647));
+  snprintf(patchTransactionId,sizeof(patchTransactionId),"%08lx%08lx",(unsigned long)bootNonce,(unsigned long)++sequence);
+  strncpy(patchTransactionOperation,operation,sizeof(patchTransactionOperation)-1);patchTransactionSlot=slot;
+  if(patch)pendingVideoPatch=*patch;
+  patchLoadPending=true;patchTransactionUncertain=false;patchRecoveringSave=false;patchRecoverUndo=false;patchTransactionSent=millis()-501;
+  page2Updated[P2_PATCH]=false;page2Updated[P2_AUDIO]=false;
+}
+
+void executePatchLoad(){
+  if(!patchLoadPending){autoeyez::Recall request;if(queuedRecalls.pop(request)){if(request.audio)beginPatchTransaction("ALOAD",request.slot,nullptr);else loadPatch(request.slot);}}
+  static unsigned long sourceSyncSent=0;if(!sourceStateSynced&&millis()-sourceSyncSent>500){Serial.println("SOURCE_STATE?");sourceSyncSent=millis();}
+  if(!patchLoadPending || millis()-patchTransactionSent<500)return;
+  patchTransactionSent=millis();
+  if(patchRecoveringSave){Serial.print(patchRecoverUndo?"PTX_UNDO:":"PTX_RECOVER:");Serial.println(patchTransactionId);return;}
+  Serial.print("PTX:");Serial.print(patchTransactionId);Serial.print(':');Serial.print(patchTransactionOperation);Serial.print(':');Serial.print(patchTransactionSlot);
+  if(patchTransactionOperation[0]=='V'){
+    Serial.print(':');for(size_t i=0;i<autoeyez::patchFieldCount;++i){if(i)Serial.print(',');Serial.print(pendingVideoPatch.values[i]);}
   }
-  if (patchLoadStep >= 1 && patchLoadStep <= 18) {
-    int i = patchLoadStep - 1 ;
-    if (cc_encoder[i] != 0) {
-      int sv = (i == 8) ? map(function_value[i], 0, 127, 0, 32) : function_value[i] ;
-      usbMIDI.sendControlChange(cc_encoder[i], sv, 1) ; usbMIDI.send_now() ;
+  Serial.println();
+}
+
+void finishPatchTransaction(const char* status){
+  if(strcmp(status,"OK")!=0 && strcmp(status,"ERROR")!=0 && strcmp(status,"UNCERTAIN")!=0)return;
+  if(strcmp(status,"UNCERTAIN")==0){patchTransactionUncertain=true;page2Updated[P2_PATCH]=false;page2Updated[P2_AUDIO]=false;return;}
+  const bool okay=strcmp(status,"OK")==0;
+  if(okay && patchRecoveringSave){
+    char path[24];snprintf(path,sizeof(path),patchTransactionOperation[0]=='V'?"/PATCH%02d.TXT":"/AUDIO%02d.TXT",patchTransactionSlot+1);
+    File saved=SD.open(path);uint32_t hash=2166136261u;while(saved&&saved.available()){uint8_t byte=saved.read();hash=autoeyez::patchChecksum(&byte,1,hash);}bool valid=bool(saved)&&hash==pendingSave.newChecksum;saved.close();
+    if(!valid){patchRecoverUndo=true;patchTransactionUncertain=true;return;}
+  }
+  const bool saving=strcmp(patchTransactionOperation+1,"SAVE")==0;
+  if(okay && strcmp(patchTransactionOperation,"VLOAD")==0){
+    for(int i=0;i<18;++i){char key[12];snprintf(key,sizeof(key),"enc%d",i);function_value[i]=pendingVideoPatch.get(key);}
+    for(int i=0;i<8;++i){char key[12];snprintf(key,sizeof(key),"ctrl%d",i);control[i]=pendingVideoPatch.get(key);}
+    for(int i=0;i<8;++i){char key[12];snprintf(key,sizeof(key),"func%d",i);function[i]=pendingVideoPatch.get(key);}
+    react_band=pendingVideoPatch.get("react");
+    Serial.print("SHADER_BAND:");Serial.println(react_band);
+    // A loaded patch becomes the new held bar position on both graph pages.
+    for(int i=0;i<18;++i)saved_function_value[i]=function_value[i];
+    lumaKeyValue=pendingVideoPatch.get("lumaKey");
+    lumaHighValue=pendingVideoPatch.get("lumaHigh");
+    lumaLowEnabled=pendingVideoPatch.get("lumaLowEn");
+    lumaHighEnabled=pendingVideoPatch.get("lumaHiEn");
+    rendererLumaInvert=pendingVideoPatch.get("renderLumaInvert");
+    rendererMirror=pendingVideoPatch.get("renderMirror");
+    mixValue=pendingVideoPatch.get("mix");
+    chASource=pendingVideoPatch.get("chA");
+    chBSource=pendingVideoPatch.get("chB");
+    lumaSourceSel=pendingVideoPatch.get("lumaSrc");
+    lumaTrackEnabled=pendingVideoPatch.get("lumaTrack");
+    mixerSubMode=pendingVideoPatch.get("mixMode");
+    clipPos=pendingVideoPatch.get("clip");
+    isLooping=pendingVideoPatch.get("loop");
+    srcHue=pendingVideoPatch.get("srcHue");
+    srcSat=pendingVideoPatch.get("srcSat");
+    srcVal=pendingVideoPatch.get("srcVal");
+    srcShader=pendingVideoPatch.get("srcShader");
+    moshValue=pendingVideoPatch.get("mosh");
+    chromaValue=pendingVideoPatch.get("chroma");
+    crushValue=pendingVideoPatch.get("crush");
+    pixelValue=pendingVideoPatch.get("pixel");
+    bleedValue=pendingVideoPatch.get("bleed");
+    alignValue=pendingVideoPatch.get("align");
+    ghostValue=pendingVideoPatch.get("ghost");
+    wobbleValue=pendingVideoPatch.get("wobble");
+    overdriveValue=pendingVideoPatch.get("overdrive");
+    holdValue=pendingVideoPatch.get("hold");
+    houseCardEnabled=pendingVideoPatch.get("houseCard");
+    houseLogoEnabled=pendingVideoPatch.get("houseLogo");
+    annLogoEnabled=pendingVideoPatch.get("mainLogo");
+    sourceConfigMenu.editing=false;mixValueSmoothed=mixValue;chASelection=chASource;chBSelection=chBSource;lumaSourceCursor=lumaSourceSel;
+    for(int i=0;i<9;++i){labelUpdated[i]=false;graphUpdated[i]=false;}
+    for(int i=0;i<4;++i){controlUpdated[i]=false;functionUpdated[i]=false;}
+    for(int i=0;i<P2_COUNT;++i)page2Updated[i]=false;
+  }
+  if(!okay && saving && !restorePendingSave()){
+    patchTransactionUncertain=true;Serial.println("SD_ERROR:TRANSACTION_RESTORE");return;
+  }
+  if(saving)erasePatchJournal();
+  if(patchTransactionOperation[0]=='V'){
+    if(okay&&saving){patchFilled[patchTransactionSlot]=true;snprintf(patchNames[patchTransactionSlot],10,"PATCH %02d",patchTransactionSlot+1);}
+    patchFlashActive=true;patchFlashSaved=saving;patchFlashError=!okay;patchFlashTimer=millis();page2Updated[P2_PATCH]=false;
+  }else{
+    if(okay&&saving)audioPatchFilled[patchTransactionSlot]=true;
+    if(okay){
+      Serial.print(saving?"SHADER_AUDIO_SAVE:":"SHADER_AUDIO_LOAD:");
+      Serial.println(patchTransactionSlot);
     }
-    patchLoadStep++ ; return ;
+    audioPatchFlashActive=true;audioPatchFlashSaved=saving;audioPatchFlashError=!okay;audioPatchFlashTimer=millis();page2Updated[P2_AUDIO]=false;page2Updated[P2_FFT_SMOOTH]=false;
   }
-  if (patchLoadStep >= 19 && patchLoadStep <= 26) {
-    int i = patchLoadStep - 19 ;
-    if (i != 7) {
-      int ccVal = control[i] ? 127 : 0 ;
-      Serial.print("CTRL ") ; Serial.print(i) ; 
-      Serial.print(" CC") ; Serial.print(cc_control[i]) ;
-      Serial.print(" = ") ; Serial.println(ccVal) ;
-      usbMIDI.sendControlChange(cc_control[i], ccVal, 1) ; usbMIDI.send_now() ;
-    }
-    patchLoadStep++ ; return ;
-  }
-  if (patchLoadStep >= 27 && patchLoadStep <= 34) {
-    int j = patchLoadStep - 27 ;
-    for (int m = 1 ; m <= 3 ; m++) { usbMIDI.sendControlChange(16 + (16 * m) + j, 0, 1) ; usbMIDI.send_now() ; }
-    if (function[j] > 0) {
-      usbMIDI.sendControlChange(16 + (16 * function[j]) + j, 127, 1) ;
-      usbMIDI.send_now() ;
-    }
-    patchLoadStep++ ; return ;
-  }
-  if (patchLoadStep == 35) {
-    for (int i = 0 ; i < 3 ; i++) { usbMIDI.sendControlChange(cc_reactive[i], 0, 1) ; usbMIDI.send_now() ; }
-    if (react_band >= 0) { usbMIDI.sendControlChange(cc_reactive[react_band], 127, 1) ; usbMIDI.send_now() ; }
-    patchLoadStep++ ; return ;
-  }
-  if (patchLoadStep == 36) {
-    Serial.println("PATCH: CC91 LOW") ;
-    usbMIDI.sendControlChange(91, 0, 1) ; usbMIDI.send_now() ;
-    patchLoadStep++ ; return ;
-  }
-  if (patchLoadStep == 37) {
-    patchLoadPending      = false ;
-    patchFlashActive      = true ;
-    patchFlashSaved       = false ;
-    patchFlashTimer       = millis() ;
-    page2Updated[P2_PATCH]     = false ;
-    page2Updated[P2_LUMA]      = false ;
-    page2Updated[P2_LUMA_HI]  = false ;
-    page2Updated[P2_LUMA_SRC]   = false ;
-    page2Updated[P2_MIXER]     = false ;
-  }
+  patchLoadPending=false;
 }
 
 // ============================================================
@@ -1309,6 +2076,13 @@ void setup() {
   audioShield.enable() ;      // Power on SGTL5000 codec
   audioShield.inputSelect(AUDIO_INPUT_LINEIN) ;  // Use line-in (not mic)
   audioShield.lineInLevel(3) ;// Input sensitivity (0-15, lower=hotter)
+  mixer.gain(0, 1.0) ;        // Left channel gain
+  mixer.gain(1, 1.0) ;        // Right channel gain
+  // Page 3 / screen 3 PASSTHRU controls these stereo monitor paths.
+  // Start muted so the saved UI default and actual audio state agree.
+  passthruMixerL.gain(0, 0.0) ;
+  passthruMixerR.gain(0, 0.0) ;
+  audioShield.volume(0.7) ;
 
   Serial.println("Audio Setup") ;
   pinMode(12, INPUT) ;
@@ -1328,12 +2102,13 @@ void setup() {
   for (int i = 0 ; i < 9 ; i++) {
     displays[i].begin(SSD1306_SWITCHCAPVCC, 0, false, true) ;
     displays[i].ssd1306_command(0x00) ; displays[i].ssd1306_command(0x11) ;
-    displays[i].clearDisplay() ; displays[i].display() ;
+    displays[i].clearDisplay() ; flushDisplay(i) ;
     updateLabel(i, boot_label[i], 4) ;
   }
   delay(50) ;
   SD.begin(SD_CS) ;
   scanPatches() ;
+  recoverPendingSave();
   scanAudioPatches() ;
 }
 
@@ -1352,25 +2127,37 @@ void invalidateAllDisplays() {
 }
 
 void switchToPage(int newPage) {
-  if (page == 2) { clearScreen(4) ; }
+  // The normal-page widgets only redraw portions of an OLED. Clear every
+  // framebuffer before the draw queue starts so no page-3 menu pixels remain.
+  // The existing OLED budget still sends at most one screen per loop.
+  oledBudget.dirty = 0 ;
+  for (int i = 0 ; i < 9 ; i++) displays[i].clearDisplay() ;
   page = newPage ;
+  fftCooldownUntil = millis() + FFT_COOLDOWN_MS ;  // pause FFT MIDI during page transition
   invalidateAllDisplays() ;
   // Reset encoder accumulators and resync positions on page switch
   enc0Accum = 0 ;
   enc1Accum = 0 ;
   enc4Accum = 0 ;
+  enc7Accum = 0 ;
   enc8Accum = 0 ;
+  lineInGainAccum = 0 ;
   lastEncPos[0]  = encoders[0]->read() ;
   lastEncPos[1]  = encoders[1]->read() ;
   lastEncPos[4]  = encoders[4]->read() ;
+  lastEncPos[7]  = encoders[7]->read() ;
   lastEncPos[8]  = encoders[8]->read() ;
   lastEncPos[17] = encoders[8]->read() ;
   // Resync scroll positions to current selections
-  chAScroll = constrain(chASelection - 1, 0, max(0, NUM_SOURCES - 3)) ;
-  chBScroll = constrain(chBSelection - 1, 0, max(0, NUM_SOURCES - 3)) ;
-  lumaSourceScroll = constrain(lumaSourceCursor - 1, 0, max(0, NUM_LUMA_SOURCES - 3)) ;
+  chAScroll = chBScroll = lumaSourceScroll = settingsScroll = 0 ;
+  keepMenuCursorVisible(chASelection, chAScroll, NUM_SOURCES) ;
+  keepMenuCursorVisible(chBSelection, chBScroll, NUM_SOURCES) ;
+  keepMenuCursorVisible(lumaSourceCursor, lumaSourceScroll, NUM_LUMA_SOURCES) ;
+  keepMenuCursorVisible(settingsCursor, settingsScroll, SETTINGS_COUNT) ;
+  patchScroll = audioPatchScroll = postFxScroll = 0 ;
+  keepMenuCursorVisible(patchCursor, patchScroll, 32) ;
+  keepMenuCursorVisible(audioPatchCursor, audioPatchScroll, 32) ;
   for(int i = 0 ; i < 8 ; i++) { LED_ON[i] = false ; }
-  for(int i = 0 ; i < 4 ; i++) { function_flash[i] = 0 ; }
   if (page == 0) {
     LED_ON[LED_6] = (react_band == 0) ;
     LED_ON[LED_7] = (react_band == 1) ;
@@ -1387,7 +2174,8 @@ void switchToPage(int newPage) {
     LED_ON[LED_6] = false ;
     LED_ON[LED_7] = true ;
     LED_ON[LED_8] = false ;
-    clearScreen(2) ; clearScreen(3) ; clearScreen(7) ;
+    postFxEditing = false ;
+    keepMenuCursorVisible(enc7Mode, postFxScroll, ENC7_MODE_COUNT) ;
     enc2Accum = 0 ;
     lastEncPos[2] = encoders[2]->read() ;
     enc5Accum = 0 ;
@@ -1397,6 +2185,9 @@ void switchToPage(int newPage) {
     for(int i = 0 ; i < 9 ; i++) { labelUpdated[i] = true ; graphUpdated[i] = true ; }
     for(int i = 0 ; i < 4 ; i++) { controlUpdated[i] = true ; functionUpdated[i] = true ; }
   }
+  for(int i=0;i<9;++i){long pos=encoders[i]->read();lastEncPos[i]=lastEncPos[i+9]=pos;}
+  enc0Accum=enc1Accum=enc2Accum=enc3Accum=enc4Accum=enc5Accum=enc6Accum=enc7Accum=enc8Accum=lineInGainAccum=0;
+
 }
 
 // ============================================================
@@ -1409,7 +2200,13 @@ void switchToPage(int newPage) {
 // ============================================================
 
 void loop() {
+  autoeyez::ControllerLoopSample loopSample(controllerPerf, micros());
+  reportControllerPerf();
   checkSerial() ;
+  if (videoFpsValid && millis() - videoFpsAt > 3000) {
+    videoFpsValid = false ; videoFpsDirty = true ;
+  }
+  if (videoFpsDirty) { videoFpsDirty = false ; flushDisplay(8) ; }
   flushVideoQueue() ;
   usbMIDI.read() ;
 
@@ -1440,7 +2237,7 @@ void loop() {
         booted = true ;
         initializeAllMidiControls() ;
         for (int i = 0 ; i < 9 ; i++) { clearScreen(i) ; }
-        Serial.println("Boot finalized") ;
+        Serial.println("Boot finalized (R4 safe initialization)") ;
       }
     }
   }
@@ -1473,6 +2270,14 @@ void loop() {
     uint16_t released = ( stableButtons & ~lastButtons) & mask ;
     held              = (~stableButtons & ~lastButtons) & mask ;
 
+    if (shaderOverlayActive) {
+      bool localInput = (pressed & mask) != 0 ;
+      for (int i = 0 ; i < 9 && !localInput ; ++i)
+        localInput = encoders[i]->read() != shaderOverlayEncoderPos[i] ;
+      if (localInput || millis() - shaderOverlaySince >= SHADER_OVERLAY_MS)
+        dismissShaderOverlay() ;
+    }
+
     byte ledByte = 0 ;
 
     // Flash timer
@@ -1498,14 +2303,17 @@ void loop() {
       // Ring buttons always work while enc8 held — no hold time requirement
       if (pressed & (1 << BTN_LOW)) {
         int prev = pendingPage ; pendingPage = 0 ;
+        ringConsumed |= (1 << BTN_LOW) ;  // mark consumed so release doesn't trigger page action
         if (prev != pendingPage) { previewPageDisplay8(pendingPage) ; suppressDisplay8Draw = true ; }
       }
       if (pressed & (1 << BTN_MID)) {
         int prev = pendingPage ; pendingPage = 1 ;
+        ringConsumed |= (1 << BTN_MID) ;
         if (prev != pendingPage) { previewPageDisplay8(pendingPage) ; suppressDisplay8Draw = true ; }
       }
       if (pressed & (1 << BTN_HI)) {
         int prev = pendingPage ; pendingPage = 2 ;
+        ringConsumed |= (1 << BTN_HI) ;
         if (prev != pendingPage) { previewPageDisplay8(pendingPage) ; suppressDisplay8Draw = true ; }
       }
 
@@ -1527,16 +2335,10 @@ void loop() {
         pageSwitched = true ;
       } else if (!wasHeldLong) {
         // Short press (not held long, no ring button) — do page action
-        if (page == 1) {
-          if (menuSelection == clipPos) {
-            isPlaying = !isPlaying ; LED_ON[LED_7] = isPlaying ;
-            sendVideoCommand(isPlaying ? "PLAY" : "PAUSE") ;
-          } else {
-            isPlaying = true ; LED_ON[LED_7] = true ;
-            char cmdBuf[16] ; snprintf(cmdBuf, 16, "PLAY:%d", menuSelection) ;
-            sendVideoCommand(cmdBuf) ;
-          }
-          videoDisplayUpdated = false ;
+        if (page == 0) {
+          beatClock.tap(millis());
+        } else if (page == 1) {
+          activateClipMenuSelection();
         } else if (page == 2) {
           if (mixerSubMode == 0) {
             chASource = chASelection ;
@@ -1563,6 +2365,7 @@ void loop() {
       ledOverride  = false ;
       pendingPage  = -1 ;
       pageSwitched = false ;
+      ringConsumed = 0 ;  // clear consumed flags
     }
 
     // ==================== PAGE-SPECIFIC CONTROLS ====================
@@ -1573,34 +2376,45 @@ void loop() {
 
       // PAGE 1 VIDEO CONTROLS
       if (page == 1) {
-        if (released & (1 << BTN_LOW)) {
+        if ((released & (1 << BTN_LOW)) && !(ringConsumed & (1 << BTN_LOW))) {
           isLooping = !isLooping ; LED_ON[LED_6] = isLooping ;
           sendVideoCommand(isLooping ? "LOOP_ON" : "LOOP_OFF") ;
           videoDisplayUpdated = false ;
         }
-        if (released & (1 << BTN_MID)) {
-          if (menuSelection == clipPos) {
-            isPlaying = !isPlaying ; LED_ON[LED_7] = isPlaying ;
-            sendVideoCommand(isPlaying ? "PLAY" : "PAUSE") ;
-          } else {
-            isPlaying = true ; LED_ON[LED_7] = true ;
-            char cmdBuf[16] ; snprintf(cmdBuf, 16, "PLAY:%d", menuSelection) ;
-            sendVideoCommand(cmdBuf) ;
-          }
-          videoDisplayUpdated = false ;
+        if ((released & (1 << BTN_MID)) && !(ringConsumed & (1 << BTN_MID))) {
+          activateClipMenuSelection();
         }
-        if (released & (1 << BTN_HI)) {
+        if ((released & (1 << BTN_HI)) && !(ringConsumed & (1 << BTN_HI))) {
           sendVideoCommand("NEXT") ; LED_ON[LED_8] = true ; skipLedTime = millis() ;
         }
         if (LED_ON[LED_8] && millis() - skipLedTime > SKIP_LED_MS) { LED_ON[LED_8] = false ; }
       }
 
-      // PAGE 0 REACTIVE
+      // PAGE 0 REACTIVE — send on PRESS so encoder moves use correct mode
       if (page == 0) {
         for(int i = 0 ; i < 3 ; i++) {
-          if (released & (1 << (BTN_LOW + i))) {
+          if ((pressed & (1 << (BTN_LOW + i))) && !(ringConsumed & (1 << (BTN_LOW + i)))) {
+            int prev_band = react_band ;
             for(int ii = 0 ; ii < 3 ; ii++) { usbMIDI.sendControlChange(cc_reactive[ii], 0, 1) ; usbMIDI.send_now() ; }
             react_band = (react_band == i) ? -1 : i ;
+            Serial.print("SHADER_BAND:");Serial.println(react_band);
+
+            // Entering reactive mode: hold both graph pages at their bases.
+            if (prev_band < 0 && react_band >= 0) {
+              for (int j = 0 ; j < 17 ; j++) {
+                if (j != 8) saved_function_value[j] = function_value[j] ;
+              }
+            }
+            // Exiting reactive mode: restore both graph pages and resend values.
+            if (prev_band >= 0 && react_band < 0) {
+              for (int j = 0 ; j < 17 ; j++) {
+                if (j == 8) continue ;
+                function_value[j] = saved_function_value[j] ;
+                if (j < 8) graphUpdated[j] = false ;
+                usbMIDI.sendControlChange(cc_encoder[j], function_value[j], 1) ; usbMIDI.send_now() ;
+              }
+            }
+
             if (react_band >= 0) { usbMIDI.sendControlChange(cc_reactive[react_band], 127, 1) ; usbMIDI.send_now() ; }
           }
         }
@@ -1611,44 +2425,91 @@ void loop() {
 
       // PAGE 2 MIXER RING BUTTONS + CONTROLS
       if (page == 2) {
-        if (released & (1 << BTN_LOW)) {
+        if ((released & (1 << BTN_LOW)) && !(ringConsumed & (1 << BTN_LOW))) {
           mixerSubMode = 0 ;
           LED_ON[LED_6] = true ; LED_ON[LED_7] = false ; LED_ON[LED_8] = false ;
           page2Updated[P2_MIXER] = false ;
         }
-        if (released & (1 << BTN_MID)) {
+        if ((released & (1 << BTN_MID)) && !(ringConsumed & (1 << BTN_MID))) {
           mixerSubMode = 1 ;
           LED_ON[LED_6] = false ; LED_ON[LED_7] = true ; LED_ON[LED_8] = false ;
           page2Updated[P2_MIXER] = false ;
         }
-        if (released & (1 << BTN_HI)) {
+        if ((released & (1 << BTN_HI)) && !(ringConsumed & (1 << BTN_HI))) {
           mixerSubMode = 2 ;
           LED_ON[LED_6] = false ; LED_ON[LED_7] = false ; LED_ON[LED_8] = true ;
           page2Updated[P2_MIXER] = false ;
         }
-        // BTN_3 = enc2 push — snap fade to nearest extreme (0 or 127)
+        // BTN_3 = enc2 push — toggle selected setting
         if (released & (1 << BTN_3)) {
-          fadeToBlackValue = (fadeToBlackValue > 63) ? 0 : 127 ;
-          usbMIDI.sendControlChange(2, fadeToBlackValue, 1) ; usbMIDI.send_now() ;
+          if (settingsCursor == 0) {
+            // Toggle adaptive scene-brightness compensation on autowaaave.
+            lumaTrackEnabled = !lumaTrackEnabled ;
+            Serial.println(lumaTrackEnabled ? "LUMA_TRACK:ON" : "LUMA_TRACK:OFF") ;
+          } else if (settingsCursor == 1) {
+            // Toggle FADE
+            fadeEnabled = !fadeEnabled ;
+            fadeToBlackValue = fadeEnabled ? 127 : 0 ;
+            usbMIDI.sendControlChange(2, fadeToBlackValue, 1) ; usbMIDI.send_now() ;
+          } else if (settingsCursor == 2) {
+            // Cycle external output; autowaaave replies with the applied mode.
+            videoOutputMode = (videoOutputMode + 1) % 3 ;
+            if (videoOutputMode == 1) Serial.println("VIDEO_OUT:COMP") ;
+            else if (videoOutputMode == 2) Serial.println("VIDEO_OUT:BOTH") ;
+            else Serial.println("VIDEO_OUT:HDMI") ;
+          } else if (settingsCursor == 3) {
+            // Toggle stereo line-in monitoring through the Audio Shield output.
+            passthruEnabled = !passthruEnabled ;
+            float passthruGain = passthruEnabled ? 1.0f : 0.0f ;
+            passthruMixerL.gain(0, passthruGain) ;
+            passthruMixerR.gain(0, passthruGain) ;
+            Serial.println(passthruEnabled ? "AUDIO_PASS:ON" : "AUDIO_PASS:OFF") ;
+          } else if (settingsCursor == 4) {
+            // Toggle HOUSE CARD - mutual exclusivity with other overlays
+            houseCardEnabled = !houseCardEnabled ;
+            if (houseCardEnabled) { houseLogoEnabled = false ; annLogoEnabled = false ; }
+            Serial.println(houseCardEnabled ? "HOUSECARD:1" : "HOUSECARD:0") ;
+            Serial.println("HOUSELOGO:0") ; Serial.println("ANNLOGO:0") ;
+          } else if (settingsCursor == 5) {
+            // Toggle HOUSE LOGO - mutual exclusivity with other overlays
+            houseLogoEnabled = !houseLogoEnabled ;
+            if (houseLogoEnabled) { houseCardEnabled = false ; annLogoEnabled = false ; }
+            Serial.println(houseLogoEnabled ? "HOUSELOGO:1" : "HOUSELOGO:0") ;
+            Serial.println("HOUSECARD:0") ; Serial.println("ANNLOGO:0") ;
+          } else if (settingsCursor == 6) {
+            // Toggle ANN LOGO - mutual exclusivity with other overlays
+            annLogoEnabled = !annLogoEnabled ;
+            if (annLogoEnabled) { houseCardEnabled = false ; houseLogoEnabled = false ; }
+            Serial.println(annLogoEnabled ? "ANNLOGO:1" : "ANNLOGO:0") ;
+            Serial.println("HOUSECARD:0") ; Serial.println("HOUSELOGO:0") ;
+          }
           page2Updated[P2_FADE] = false ;
         }
-        // BTN_1 = toggle luma low on/off
+        // Source Config: toggle selected enable or enter/leave its value editor.
         if (released & (1 << BTN_1)) {
-          lumaLowEnabled = !lumaLowEnabled ;
-          char cmdBuf[24] ;
-          snprintf(cmdBuf, 24, "LUMA:%d", lumaLowEnabled ? lumaKeyValue : 0) ;
-          sendVideoCommand(cmdBuf) ;
-          page2Updated[P2_LUMA] = false ;
+          int action=sourceConfigMenu.click(); enc0Accum=0;
+          if(action==1){
+            lumaLowEnabled=!lumaLowEnabled;
+            char cmd[24];snprintf(cmd,sizeof(cmd),"LUMA:%d",lumaLowEnabled?lumaKeyValue:0);sendVideoCommand(cmd);
+          } else if(action==2){
+            lumaHighEnabled=!lumaHighEnabled;
+            char cmd[24];snprintf(cmd,sizeof(cmd),"LUMA_HIGH_EN:%d",lumaHighEnabled?1:0);sendVideoCommand(cmd);
+          }
+          page2Updated[P2_LUMA]=false;
         }
-        // BTN_2 = toggle luma high on/off
         if (released & (1 << BTN_2)) {
-          lumaHighEnabled = !lumaHighEnabled ;
-          char cmdBuf[24] ;
-          snprintf(cmdBuf, 24, "LUMA_HIGH_EN:%d", lumaHighEnabled ? 1 : 0) ;
-          sendVideoCommand(cmdBuf) ;
-          page2Updated[P2_LUMA_HI] = false ;
+          if(rendererCursor==0)rendererLumaInvert=!rendererLumaInvert;
+          else rendererMirror=!rendererMirror;
+          usbMIDI.sendControlChange(rendererCursor==0?100:101,
+            (rendererCursor==0?rendererLumaInvert:rendererMirror)?127:0,1);usbMIDI.send_now();
+          page2Updated[P2_LUMA_HI]=false;
         }
-        // BTN_4 = confirm luma source selection
+        // BTN_4 = cycle FFT param mode (Smooth/Attack/Decay/B-Decay)
+        if (released & (1 << BTN_4)) {
+          enc3Mode = (enc3Mode + 1) % ENC3_MODE_COUNT ;
+          page2Updated[P2_FFT_SMOOTH] = false ;
+        }
+        // BTN_5 = confirm luma source selection
         if (released & (1 << BTN_5)) {
           lumaSourceSel = lumaSourceCursor ;
           char cmdBuf[16] ; snprintf(cmdBuf, 16, "LUMA_SRC:%d", lumaSourceSel) ;
@@ -1662,11 +2523,9 @@ void loop() {
         if (held & (1 << BTN_6)) {
           if (millis() - btn6PressTime >= PATCH_HOLD_MS && !btn6HeldLong) {
             btn6HeldLong     = true ;
-            savePatch(patchCursor) ;
-            patchFlashActive = true ;
-            patchFlashSaved  = true ;
-            patchFlashTimer  = millis() ;
-            page2Updated[P2_PATCH] = false ;
+            if(!patchLoadPending && !savePatch(patchCursor)){
+              patchFlashActive=true;patchFlashSaved=false;patchFlashError=true;patchFlashTimer=millis();page2Updated[P2_PATCH]=false;
+            }
           }
         }
         if (released & (1 << BTN_6)) {
@@ -1685,41 +2544,44 @@ void loop() {
         if (held & (1 << BTN_7)) {
           if (millis() - btn7PressTime >= PATCH_HOLD_MS && !btn7HeldLong) {
             btn7HeldLong          = true ;
-            usbMIDI.sendControlChange(92, audioPatchCursor + 1, 1) ; usbMIDI.send_now() ;
-            // Write marker file to SD so slot shows as filled after reboot
-            AudioNoInterrupts() ;
-            char mname[24] ;
-            snprintf(mname, 24, "/AUDIO%02d.TXT", audioPatchCursor + 1) ;
-            if (!SD.exists(mname)) {
-              File mf = SD.open(mname, FILE_WRITE) ;
-              if (mf) mf.close() ;
+            if(!patchLoadPending){
+              char path[24];snprintf(path,sizeof(path),"/AUDIO%02d.TXT",audioPatchCursor+1);patchSaveHadPrevious=SD.exists(path);
+              beginPatchTransaction("ASAVE",audioPatchCursor,nullptr);
+              const char marker[]="marker=1\r\n";
+              if(recordPendingSave(marker,sizeof(marker)-1)&&saveAudioMarker(audioPatchCursor)){}
+              else {patchLoadPending=false;erasePatchJournal();audioPatchFlashActive=true;audioPatchFlashSaved=true;audioPatchFlashError=true;audioPatchFlashTimer=millis();page2Updated[P2_AUDIO]=false;}
             }
-            AudioInterrupts() ;
-            audioPatchFilled[audioPatchCursor] = true ;
-            audioPatchFlashActive = true ;
-            audioPatchFlashSaved  = true ;
-            audioPatchFlashTimer  = millis() ;
-            page2Updated[P2_AUDIO] = false ;
           }
         }
         if (released & (1 << BTN_7)) {
           if (!btn7HeldLong) {
-            if (audioPatchFilled[audioPatchCursor]) {
-              usbMIDI.sendControlChange(93, audioPatchCursor + 1, 1) ; usbMIDI.send_now() ;
-              audioPatchFlashActive = true ;
-              audioPatchFlashSaved  = false ;
-              audioPatchFlashTimer  = millis() ;
-              page2Updated[P2_AUDIO] = false ;
+            if (autoeyez::validControllerAudioSlot(audioPatchCursor) && audioPatchFilled[audioPatchCursor]) {
+              if(!patchLoadPending)beginPatchTransaction("ALOAD",audioPatchCursor,nullptr);
+              else if(!queuedRecalls.push(true,audioPatchCursor)){recallQueueFullAt=millis();Serial.println("PATCH_ERROR:RECALL_QUEUE_FULL");page2Updated[P2_AUDIO]=false;}
             }
           }
           btn7HeldLong = false ;
+        }
+        // BTN_8 = enter the selected post-FX graph, or return to its list.
+        if (released & (1 << BTN_8)) {
+          postFxEditing = !postFxEditing ;
+          enc7Accum = 0 ;
+          lastEncPos[7] = encoders[7]->read() ;
+          page2Updated[P2_MOSH] = false ;
         }
       }
 
     } // end !enc8HeldLong
 
+    // Share the newest coherent FFT snapshot; the sender keeps its existing gates.
+    refreshControllerFft();
+    beatClock.feed(fftSnapshot,millis());
+    processFftBands() ;
+
     // Spectrum runs outside enc8 guard (visual only, no side effects)
     if (page == 0) { drawSpectrum() ; }
+
+    usbMIDI.read() ;  // keep USB healthy
 
     // ==================== CONTROL GROUP (pages 0+1) ====================
     if (page < 2) {
@@ -1759,17 +2621,6 @@ void loop() {
           if (function[temp_function] == 4) { function[temp_function] = 0 ; }
           else { usbMIDI.sendControlChange(16 + (16 * function[temp_function]) + temp_function, 127, 1) ; usbMIDI.send_now() ; }
           functionUpdated[i] = false ;
-          function_flash[i] = 1500 ;
-          if (page == 0) { LED_ON[LED_1 + i] = min(1, function[temp_function]) ; }
-        }
-      }
-      if (page == 0) {
-        for(int i = 0 ; i < 4 ; i++) {
-          function_flash[i] = max(0, function_flash[i] - (function[i] * (3 + (3 * !LED_ON[LED_1 + i])))) ;
-          if (function_flash[i] == 0) {
-            function_flash[i] = 1500 ;
-            LED_ON[LED_1 + i] = (1 - LED_ON[LED_1 + i]) * min(1, function[i]) ;
-          }
         }
       }
     }
@@ -1782,10 +2633,18 @@ void loop() {
         int temp_function = i + (9 * page) ;
         if (pos == lastEncPos[temp_function]) continue ;
         if (temp_function >= 18) continue ;
-        int dir = (pos > lastEncPos[temp_function]) ? -1 : 1 ;
-        function_value[temp_function] += encoder_speed * dir * function_direction[temp_function] ;
-        function_value[temp_function] = constrain(function_value[temp_function], 0, 127) ;
+        int32_t delta = autoeyez::encoderDifference(lastEncPos[temp_function],pos);
         lastEncPos[temp_function] = pos ;
+        if (temp_function == 8) {
+          // The Encoder library reports four edges per physical detent.
+          // Keep the remainder so one detent changes line-in gain by one step.
+          lineInGainAccum += delta ;
+          delta = autoeyez::takeSteps(lineInGainAccum, 4) ;
+          if (!delta) continue ;
+          function_value[8] = autoeyez::boundedValue(function_value[8],delta*function_direction[8],0,127);
+        } else {
+          function_value[temp_function] = autoeyez::boundedValue(function_value[temp_function],int64_t(encoder_speed)*delta*function_direction[temp_function],0,127);
+        }
         if (i < 8) { graphUpdated[i] = false ; }
         if (i == 8 && page == 0) { graphUpdated[8] = false ; }
         int sendVal = (temp_function == 8) ? map(function_value[temp_function], 0, 127, 0, 32) : function_value[temp_function] ;
@@ -1796,166 +2655,191 @@ void loop() {
     // ==================== ENCODER 8 — page 1 clip menu ====================
     if (page == 1) {
       long pos8 = encoders[8]->read() ;
-      enc8Accum += lastEncPos[17] - pos8 ;
+      enc8Accum += autoeyez::encoderDifference(lastEncPos[17],pos8) ;
       lastEncPos[17] = pos8 ;
-      if (enc8Accum >= 4) {
-        enc8Accum = 0 ;
-        menuSelection = constrain(menuSelection + 1, 0, max(0, clipCount - 1)) ;
-        if (menuSelection >= menuScroll + 3) menuScroll = menuSelection - 2 ;
-        videoDisplayUpdated = false ;
-      } else if (enc8Accum <= -4) {
-        enc8Accum = 0 ;
-        menuSelection = constrain(menuSelection - 1, 0, max(0, clipCount - 1)) ;
-        if (menuSelection < menuScroll) menuScroll = menuSelection ;
-        videoDisplayUpdated = false ;
-      }
+        int delta=autoeyez::takeSteps(enc8Accum,4);
+        if(delta){
+          clipMenu.step(delta,clipCount);
+          videoDisplayUpdated=false;
+        }
     }
 
     // ==================== PAGE 2 ENCODERS ====================
     if (page == 2) {
-      // Encoder 0: luma key — threshold 2 (fast)
+      // Encoder 0: navigate Source Config; edit the opened threshold.
       {
-        long pos0 = encoders[0]->read() ;
-        enc0Accum += lastEncPos[0] - pos0 ;
-        lastEncPos[0] = pos0 ;
-        if (enc0Accum >= 2) {
-          enc0Accum = 0 ;
-          lumaKeyValue = constrain(lumaKeyValue + 1, 0, lumaHighValue) ;
-          char cmdBuf[16] ; snprintf(cmdBuf, 16, "LUMA:%d", lumaLowEnabled ? lumaKeyValue : 0) ;
-          sendVideoCommand(cmdBuf) ; page2Updated[P2_LUMA] = false ;
-        } else if (enc0Accum <= -2) {
-          enc0Accum = 0 ;
-          lumaKeyValue = constrain(lumaKeyValue - 1, 0, lumaHighValue) ;
-          char cmdBuf[16] ; snprintf(cmdBuf, 16, "LUMA:%d", lumaLowEnabled ? lumaKeyValue : 0) ;
-          sendVideoCommand(cmdBuf) ; page2Updated[P2_LUMA] = false ;
+        long pos=encoders[0]->read();enc0Accum+=autoeyez::encoderDifference(lastEncPos[0],pos);lastEncPos[0]=pos;
+        int threshold=sourceConfigMenu.editing?2:4;
+        int delta=autoeyez::takeSteps(enc0Accum,threshold);
+        if(delta){
+          sourceConfigMenu.turn(delta,lumaKeyValue,lumaHighValue);
+          if(sourceConfigMenu.editing){
+            char cmd[24];
+            if(sourceConfigMenu.cursor==1)snprintf(cmd,sizeof(cmd),"LUMA:%d",lumaLowEnabled?lumaKeyValue:0);
+            else snprintf(cmd,sizeof(cmd),"LUMA_HIGH:%d",lumaHighValue);
+            sendVideoCommand(cmd);
+          }
+          page2Updated[P2_LUMA]=false;
         }
       }
-      // Encoder 1: luma high — threshold 2, clamped above lumaKeyValue
+      // Encoder 1: navigate Renderer rows.
       {
-        long pos1 = encoders[1]->read() ;
-        enc1Accum += lastEncPos[1] - pos1 ;
-        lastEncPos[1] = pos1 ;
-        if (enc1Accum >= 2) {
-          enc1Accum = 0 ;
-          lumaHighValue = constrain(lumaHighValue + 1, lumaKeyValue, 127) ;
-          char cmdBuf[24] ; snprintf(cmdBuf, 24, "LUMA_HIGH:%d", lumaHighValue) ;
-          sendVideoCommand(cmdBuf) ; page2Updated[P2_LUMA_HI] = false ;
-        } else if (enc1Accum <= -2) {
-          enc1Accum = 0 ;
-          lumaHighValue = constrain(lumaHighValue - 1, lumaKeyValue, 127) ;
-          char cmdBuf[24] ; snprintf(cmdBuf, 24, "LUMA_HIGH:%d", lumaHighValue) ;
-          sendVideoCommand(cmdBuf) ; page2Updated[P2_LUMA_HI] = false ;
+        long pos=encoders[1]->read();enc1Accum+=autoeyez::encoderDifference(lastEncPos[1],pos);lastEncPos[1]=pos;
+        int delta=autoeyez::takeSteps(enc1Accum,4);if(delta){rendererCursor=autoeyez::wrappedValue(rendererCursor,delta,2);page2Updated[P2_LUMA_HI]=false;}
+      }
+
+      // Encoder 2: scroll through settings — threshold 4
+      {
+        long pos2 = encoders[2]->read() ;
+        enc2Accum += autoeyez::encoderDifference(lastEncPos[2],pos2) ;
+        lastEncPos[2] = pos2 ;
+        int delta=autoeyez::takeSteps(enc2Accum,4);
+        if(delta){
+          settingsCursor=autoeyez::wrappedValue(settingsCursor,delta,SETTINGS_COUNT);
+          keepMenuCursorVisible(settingsCursor,settingsScroll,SETTINGS_COUNT);
+          page2Updated[P2_FADE]=false;
         }
       }
 
-      // Encoder 2: fade to black — threshold 2
+      // Encoder 3: FFT params (Smooth/Attack/Decay/B-Decay) — threshold 2
       {
-        long pos2 = encoders[2]->read() ;
-        enc2Accum += lastEncPos[2] - pos2 ;
-        lastEncPos[2] = pos2 ;
-        if (enc2Accum >= 2) {
-          enc2Accum = 0 ;
-          fadeToBlackValue = constrain(fadeToBlackValue + 2, 0, 127) ;
-          usbMIDI.sendControlChange(2, fadeToBlackValue, 1) ; usbMIDI.send_now() ;
-          page2Updated[P2_FADE] = false ;
-        } else if (enc2Accum <= -2) {
-          enc2Accum = 0 ;
-          fadeToBlackValue = constrain(fadeToBlackValue - 2, 0, 127) ;
-          usbMIDI.sendControlChange(2, fadeToBlackValue, 1) ; usbMIDI.send_now() ;
-          page2Updated[P2_FADE] = false ;
+        long pos3 = encoders[3]->read() ;
+        enc3Accum += autoeyez::encoderDifference(lastEncPos[3],pos3) ;
+        lastEncPos[3] = pos3 ;
+        int delta = 2 * autoeyez::takeSteps(enc3Accum,2);
+        if (delta != 0) {
+          char cmdBuf[32] ;
+          switch (enc3Mode) {
+            case 0:  // Smooth
+              fftSmoothValue = constrain(fftSmoothValue + delta, 0, 127) ;
+              snprintf(cmdBuf, 32, "FFT_SMOOTH:%d", fftSmoothValue) ;
+              break ;
+            case 1:  // Attack
+              fftAttackValue = constrain(fftAttackValue + delta, 0, 127) ;
+              bandAttackRate = fftAttackValue / 127.0f ;
+              snprintf(cmdBuf, 32, "FFT_ATTACK:%d", fftAttackValue) ;
+              break ;
+            case 2:  // Decay
+              fftDecayValue = constrain(fftDecayValue + delta, 0, 127) ;
+              bandDecayRate = fftDecayValue / 127.0f ;
+              snprintf(cmdBuf, 32, "FFT_DECAY:%d", fftDecayValue) ;
+              break ;
+            case 3:  // B-Decay (band decay)
+              fftBandDecayValue = constrain(fftBandDecayValue + delta, 0, 127) ;
+              snprintf(cmdBuf, 32, "FFT_BDECAY:%d", fftBandDecayValue) ;
+              break ;
+            case 4:  // Hit (transient jump amount)
+              fftHitValue = constrain(fftHitValue + delta, 0, 127) ;
+              snprintf(cmdBuf, 32, "FFT_HIT:%d", fftHitValue) ;
+              break ;
+            case 5:  // Slide (slide-in rate after transient)
+              fftSlideValue = constrain(fftSlideValue + delta, 0, 127) ;
+              snprintf(cmdBuf, 32, "FFT_SLIDE:%d", fftSlideValue) ;
+              break ;
+          }
+          Serial.println(cmdBuf) ;
+          page2Updated[P2_FFT_SMOOTH] = false ;
         }
       }
 
       // Encoder 5: patch scroll — threshold 4
       {
         long pos5 = encoders[5]->read() ;
-        enc5Accum += lastEncPos[5] - pos5 ;
+        enc5Accum += autoeyez::encoderDifference(lastEncPos[5],pos5) ;
         lastEncPos[5] = pos5 ;
-        if (enc5Accum >= 4) {
-          enc5Accum = 0 ;
-          patchCursor = constrain(patchCursor + 1, 0, 31) ;
-          if (patchCursor >= patchScroll + 3) patchScroll = patchCursor - 2 ;
-          page2Updated[P2_PATCH] = false ;
-        } else if (enc5Accum <= -4) {
-          enc5Accum = 0 ;
-          patchCursor = constrain(patchCursor - 1, 0, 31) ;
-          if (patchCursor < patchScroll) patchScroll = patchCursor ;
-          page2Updated[P2_PATCH] = false ;
+        int delta=autoeyez::takeSteps(enc5Accum,4);
+        if(delta){
+          patchCursor=autoeyez::boundedValue(patchCursor,delta,0,31);
+          keepMenuCursorVisible(patchCursor,patchScroll,32);
+          page2Updated[P2_PATCH]=false;
         }
       }
 
       // Encoder 6: audio patch scroll — threshold 4
       {
         long pos6 = encoders[6]->read() ;
-        enc6Accum += lastEncPos[6] - pos6 ;
+        enc6Accum += autoeyez::encoderDifference(lastEncPos[6],pos6) ;
         lastEncPos[6] = pos6 ;
-        if (enc6Accum >= 4) {
-          enc6Accum = 0 ;
-          audioPatchCursor = constrain(audioPatchCursor + 1, 0, 31) ;
-          if (audioPatchCursor >= audioPatchScroll + 3) audioPatchScroll = audioPatchCursor - 2 ;
-          page2Updated[P2_AUDIO] = false ;
-        } else if (enc6Accum <= -4) {
-          enc6Accum = 0 ;
-          audioPatchCursor = constrain(audioPatchCursor - 1, 0, 31) ;
-          if (audioPatchCursor < audioPatchScroll) audioPatchScroll = audioPatchCursor ;
-          page2Updated[P2_AUDIO] = false ;
+        int delta=autoeyez::takeSteps(enc6Accum,4);
+        if(delta){
+          audioPatchCursor=autoeyez::boundedValue(audioPatchCursor,delta,0,31);
+          keepMenuCursorVisible(audioPatchCursor,audioPatchScroll,32);
+          page2Updated[P2_AUDIO]=false;
+        }
+      }
+
+      // Encoder 7: scroll the post-FX list; edit only after pressing it.
+      {
+        long pos7 = encoders[7]->read() ;
+        enc7Accum += autoeyez::encoderDifference(lastEncPos[7],pos7) ;
+        lastEncPos[7] = pos7 ;
+        int delta = autoeyez::takeSteps(enc7Accum,postFxEditing ? 2 : 4);
+        if (delta != 0) {
+          if (!postFxEditing) {
+            enc7Mode = autoeyez::boundedValue(enc7Mode,delta,0,ENC7_MODE_COUNT-1) ;
+            keepMenuCursorVisible(enc7Mode, postFxScroll, ENC7_MODE_COUNT) ;
+          } else {
+            switch (enc7Mode) {
+              case 0:  // Mosh
+                moshValue = constrain(moshValue + delta, 0, 127) ;
+                usbMIDI.sendControlChange(94, moshValue, 1) ; usbMIDI.send_now() ;
+                break ;
+              case 1:  // Chroma
+                chromaValue = constrain(chromaValue + delta, 0, 127) ;
+                usbMIDI.sendControlChange(95, chromaValue, 1) ; usbMIDI.send_now() ;
+                break ;
+              case 2:  // Crush
+                crushValue = constrain(crushValue + delta, 0, 127) ;
+                usbMIDI.sendControlChange(96, crushValue, 1) ; usbMIDI.send_now() ;
+                break ;
+              case 3:  // Pixel
+                pixelValue = constrain(pixelValue + delta, 0, 127) ;
+                usbMIDI.sendControlChange(97, pixelValue, 1) ; usbMIDI.send_now() ;
+                break ;
+              case 4: case 5: case 6: case 7: case 8: {
+                const int effect = enc7Mode - 4 ;
+                int* base[] = { &bleedValue, &alignValue, &ghostValue, &wobbleValue, &overdriveValue } ;
+                int& value = react_band < 0 ? *base[effect] : processingReactiveValues[react_band][effect] ;
+                value = constrain(value + delta, 0, 127) ;
+                usbMIDI.sendControlChange(102 + effect, value, 1) ; usbMIDI.send_now() ;
+                break ;
+              }
+              case 9: {
+                int& value = react_band < 0 ? holdValue : holdReactiveValues[react_band] ;
+                value = constrain(value + delta, 0, 127) ;
+                usbMIDI.sendControlChange(107, value, 1) ; usbMIDI.send_now() ;
+                break ;
+              }
+            }
+          }
+          page2Updated[P2_MOSH] = false ;
         }
       }
 
       // Encoder 4: luma source — threshold 4
       {
         long pos4 = encoders[4]->read() ;
-        enc4Accum += lastEncPos[4] - pos4 ;
+        enc4Accum += autoeyez::encoderDifference(lastEncPos[4],pos4) ;
         lastEncPos[4] = pos4 ;
-        if (enc4Accum >= 4) {
-          enc4Accum = 0 ;
-          lumaSourceCursor = constrain(lumaSourceCursor + 1, 0, NUM_LUMA_SOURCES - 1) ;
-          if (lumaSourceCursor >= lumaSourceScroll + 3) lumaSourceScroll = lumaSourceCursor - 2 ;
-          page2Updated[P2_LUMA_SRC] = false ;
-        } else if (enc4Accum <= -4) {
-          enc4Accum = 0 ;
-          lumaSourceCursor = constrain(lumaSourceCursor - 1, 0, NUM_LUMA_SOURCES - 1) ;
-          if (lumaSourceCursor < lumaSourceScroll) lumaSourceScroll = lumaSourceCursor ;
-          page2Updated[P2_LUMA_SRC] = false ;
+        int delta=autoeyez::takeSteps(enc4Accum,4);
+        if(delta){
+          lumaSourceCursor=autoeyez::boundedValue(lumaSourceCursor,delta,0,MAX_LUMA_SOURCE_INDEX);
+          keepMenuCursorVisible(lumaSourceCursor,lumaSourceScroll,NUM_LUMA_SOURCES);
+          page2Updated[P2_LUMA_SRC]=false;
         }
       }
 
       // Encoder 8: mix (threshold 2) or source list (threshold 4)
       {
         long pos8 = encoders[8]->read() ;
-        enc8Accum += lastEncPos[17] - pos8 ;
+        enc8Accum += autoeyez::encoderDifference(lastEncPos[17],pos8) ;
         lastEncPos[17] = pos8 ;
         int threshold = (mixerSubMode == 1) ? 2 : 4 ;
-        if (enc8Accum >= threshold) {
-          enc8Accum = 0 ;
-          if (mixerSubMode == 1) {
-            mixValue = constrain(mixValue + 1, 0, 127) ;
-            char cmdBuf[16] ; snprintf(cmdBuf, 16, "MIX:%d", mixValue) ;
-            sendVideoCommand(cmdBuf) ; page2Updated[P2_MIXER] = false ;
-          } else if (mixerSubMode == 0) {
-            chASelection = constrain(chASelection + 1, 0, NUM_SOURCES - 1) ;
-            if (chASelection >= chAScroll + 4) chAScroll = chASelection - 3 ;
-            page2Updated[P2_MIXER] = false ;
-          } else if (mixerSubMode == 2) {
-            chBSelection = constrain(chBSelection + 1, 0, NUM_SOURCES - 1) ;
-            if (chBSelection >= chBScroll + 4) chBScroll = chBSelection - 3 ;
-            page2Updated[P2_MIXER] = false ;
-          }
-        } else if (enc8Accum <= -threshold) {
-          enc8Accum = 0 ;
-          if (mixerSubMode == 1) {
-            mixValue = constrain(mixValue - 1, 0, 127) ;
-            char cmdBuf[16] ; snprintf(cmdBuf, 16, "MIX:%d", mixValue) ;
-            sendVideoCommand(cmdBuf) ; page2Updated[P2_MIXER] = false ;
-          } else if (mixerSubMode == 0) {
-            chASelection = constrain(chASelection - 1, 0, NUM_SOURCES - 1) ;
-            if (chASelection < chAScroll) chAScroll = chASelection ;
-            page2Updated[P2_MIXER] = false ;
-          } else if (mixerSubMode == 2) {
-            chBSelection = constrain(chBSelection - 1, 0, NUM_SOURCES - 1) ;
-            if (chBSelection < chBScroll) chBScroll = chBSelection ;
-            page2Updated[P2_MIXER] = false ;
-          }
+        int delta=autoeyez::takeSteps(enc8Accum,threshold);
+        if(delta){
+          if(mixerSubMode==1){mixValue=autoeyez::boundedValue(mixValue,delta,0,127);char cmdBuf[16];snprintf(cmdBuf,16,"MIX:%d",mixValue);sendVideoCommand(cmdBuf);}
+          else {int& selection=mixerSubMode==0?chASelection:chBSelection;int& scroll=mixerSubMode==0?chAScroll:chBScroll;selection=autoeyez::boundedValue(selection,delta,0,MAX_SOURCE_INDEX);keepMenuCursorVisible(selection,scroll,NUM_SOURCES);}
+          page2Updated[P2_MIXER]=false;
         }
       }
     }
@@ -1981,16 +2865,21 @@ void loop() {
       LED_ON[LED_8] = flash2 ;
     }
 
+    for (int i=0;i<4;i++) LED_ON[LED_1+i]=beatClock.pulse(millis()) && beatClock.step==i+1;
     static byte lastLedByte = 0xFF ;
     for(int i = 0 ; i < 8 ; i++) { if (LED_ON[i]) ledByte |= (1 << i) ; }
     if (ledByte != lastLedByte) { setLEDs(ledByte) ; lastLedByte = ledByte ; }
 
-    // Smooth mix value toward target
+    // Smooth mix value toward target (rate-limited display updates)
     if (page == 2) {
       float diff = (float)mixValue - mixValueSmoothed ;
       if (abs(diff) > 0.2f) {
         mixValueSmoothed += diff * MIX_SMOOTH ;
-        page2Updated[P2_MIXER] = false ;
+        // Only invalidate display at limited rate to avoid starving MIDI
+        if (millis() - lastMixerDisplayUpdate > MIXER_DISPLAY_INTERVAL_MS) {
+          page2Updated[P2_MIXER] = false ;
+          lastMixerDisplayUpdate = millis() ;
+        }
       } else {
         mixValueSmoothed = (float)mixValue ;
       }
@@ -2009,28 +2898,32 @@ void loop() {
     executePatchLoad() ;
 
     // ==================== DRAW QUEUE ====================
+    usbMIDI.read() ;  // keep USB healthy before display draws
     done = false ;
 
+    if (shaderOverlayActive && shaderOverlayDirty) {
+      drawShaderOverlay() ;
+      return ;
+    }
+
     if (!done && page == 2) {
-      if (!done && !page2Updated[P2_FADE])    { drawFadeDisplay() ;       done = true ; return ; }
+      if (!done && !page2Updated[P2_FADE])    { drawSettingsDisplay() ;   done = true ; return ; }
+      if (!done && !page2Updated[P2_FFT_SMOOTH]) { drawFftSmoothDisplay() ; done = true ; return ; }
       if (!done && !page2Updated[P2_LUMA])    { drawLumaKeyDisplay() ;    done = true ; return ; }
       if (!done && !page2Updated[P2_LUMA_HI]){ drawLumaHighDisplay() ;   done = true ; return ; }
       if (!done && !page2Updated[P2_LUMA_SRC]) { drawLumaSourceDisplay() ; done = true ; return ; }
       if (!done && !page2Updated[P2_PATCH])   { drawPatchDisplay() ;      done = true ; return ; }
       if (!done && !page2Updated[P2_AUDIO]) { drawAudioPatchDisplay() ; done = true ; return ; }
-      if (!done && !page2Updated[P2_MIXER] && !suppressDisplay8Draw) { drawMixerDisplay() ; done = true ; return ; }
-      int blankScreens[] = {3, 7} ;
-      for (int i = 0 ; i < 2 ; i++) {
-        if (!page2ClearUpdated[i]) {
-          clearScreen(blankScreens[i]) ;
-          page2ClearUpdated[i] = true ;
-          done = true ; return ;
-        }
-      }
+      if (!done && !page2Updated[P2_MOSH])  { drawMoshDisplay() ;       done = true ; return ; }
+      if (!done && !page2Updated[P2_MIXER] && !suppressDisplay8Draw && !shaderOverlayActive) { drawMixerDisplay() ; done = true ; return ; }
+      // All page 2 displays now in use (no blank screens)
     }
 
-    if (!done && page == 1 && !videoDisplayUpdated && !suppressDisplay8Draw) { drawVideoDisplay() ; done = true ; return ; }
-    if (!done && page == 0 && !graphUpdated[8] && !suppressDisplay8Draw)     { updateVolumeDisplay() ; graphUpdated[8] = true ; done = true ; return ; }
+    // Page 3 owns full-screen displays; legacy arrays cover only pages 1 and 2.
+    if (page == 2) return;
+
+    if (!done && page == 1 && !videoDisplayUpdated && !suppressDisplay8Draw && !shaderOverlayActive) { drawVideoDisplay() ; done = true ; return ; }
+    if (!done && page == 0 && !graphUpdated[8] && !suppressDisplay8Draw && !shaderOverlayActive)     { updateVolumeDisplay() ; graphUpdated[8] = true ; done = true ; return ; }
 
     if (!done) {
       for(int i = 0 ; i < 9 ; i++) {
@@ -2069,4 +2962,45 @@ void loop() {
       }
     }
   }
+}
+
+
+bool erasePatchJournal(){
+  SD.remove("/PTX.TMP");
+  if(SD.exists("/PTX.BAK")&&!SD.remove("/PTX.BAK"))return false;
+  if(SD.exists("/PTX.TXT")&&!SD.remove("/PTX.TXT"))return false;
+  return true;
+}
+bool recordPendingSave(const void* data,size_t length){
+  pendingSave=autoeyez::PendingSave{};
+  strncpy(pendingSave.transaction,patchTransactionId,16);strncpy(pendingSave.operation,patchTransactionOperation,5);pendingSave.slot=patchTransactionSlot;pendingSave.hadPrevious=patchSaveHadPrevious;
+  pendingSave.newChecksum=autoeyez::patchChecksum(data,length);
+  char path[24];snprintf(path,sizeof(path),patchTransactionOperation[0]=='V'?"/PATCH%02d.TXT":"/AUDIO%02d.TXT",patchTransactionSlot+1);
+  if(patchSaveHadPrevious){File previous=SD.open(path);if(!previous)return false;uint32_t hash=2166136261u;while(previous.available()){uint8_t byte=previous.read();hash=autoeyez::patchChecksum(&byte,1,hash);}previous.close();pendingSave.previousChecksum=hash;}
+  for(size_t i=0;i<autoeyez::patchFieldCount;++i)pendingSave.values[i]=pendingVideoPatch.values[i];pendingSave.seal();
+  return autoeyez::saveVerifiedPatch(SD,"/PTX.TXT","/PTX.TMP","/PTX.BAK",reinterpret_cast<const char*>(&pendingSave),sizeof(pendingSave),FILE_WRITE)==autoeyez::SaveResult::Saved;
+}
+bool restorePendingSave(){
+  if(!pendingSave.valid())return false;
+  char path[24],backup[24];snprintf(path,sizeof(path),pendingSave.operation[0]=='V'?"/PATCH%02d.TXT":"/AUDIO%02d.TXT",pendingSave.slot+1);snprintf(backup,sizeof(backup),pendingSave.operation[0]=='V'?"/PATCH%02d.BAK":"/AUDIO%02d.BAK",pendingSave.slot+1);
+  auto checksum=[](const char* filename,uint32_t& hash){File file=SD.open(filename);if(!file)return false;hash=2166136261u;while(file.available()){uint8_t byte=file.read();hash=autoeyez::patchChecksum(&byte,1,hash);}file.close();return true;};
+  uint32_t current=0;bool exists=checksum(path,current);
+  if(pendingSave.hadPrevious && exists && current==pendingSave.previousChecksum)return true;
+  if(!pendingSave.hadPrevious && !exists)return true;
+  if(exists && current!=pendingSave.newChecksum)return false;
+  if(!pendingSave.hadPrevious)return !exists||SD.remove(path);
+  uint32_t old=0;if(!checksum(backup,old)||old!=pendingSave.previousChecksum)return false;
+  if(exists&&!SD.remove(path))return false;
+  return SD.rename(backup,path);
+}
+void recoverPendingSave(){
+  if(!autoeyez::recoverPatch(SD,"/PTX.TXT","/PTX.BAK"))return;
+  if(!SD.exists("/PTX.TXT"))return;
+  File file=SD.open("/PTX.TXT");autoeyez::PendingSave recovered;
+  bool okay=file&&file.size()==sizeof(recovered)&&file.read(reinterpret_cast<uint8_t*>(&recovered),sizeof(recovered))==int(sizeof(recovered));file.close();
+  if(!okay||!recovered.valid()){Serial.println("SD_ERROR:TRANSACTION_JOURNAL");return;}
+  pendingSave=recovered;strncpy(patchTransactionId,recovered.transaction,17);strncpy(patchTransactionOperation,recovered.operation,6);patchTransactionSlot=recovered.slot;patchSaveHadPrevious=recovered.hadPrevious;
+  for(size_t i=0;i<autoeyez::patchFieldCount;++i){pendingVideoPatch.values[i]=recovered.values[i];pendingVideoPatch.seen[i]=true;}
+  patchLoadPending=true;patchRecoveringSave=true;patchRecoverUndo=false;patchTransactionSent=millis()-501;
+  Serial.println("PATCH:RECOVERING_PENDING_SAVE");
 }

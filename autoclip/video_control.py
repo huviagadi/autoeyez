@@ -53,11 +53,12 @@ SEND_PORT = 5005         # Port to send state updates TO autowaaave
 RECV_PORT = 5006         # Port to receive commands FROM autowaaave
 
 # File paths
-CLIPS_DIR = '/boot/firmware/clips/'   # MP4 clips stored on boot partition
+CLIPS_DIR = '/home/admin/clips/'   # MP4 clips directory
 STATE_FILE = '/tmp/player_state.json' # Video player writes state here
 CMD_FILE   = '/tmp/player_cmd.json'   # We write commands for video player here
 MIXER_STATE_FILE = '/tmp/mixer_state.json'  # Mixer writes state here (unused currently)
 MIXER_CMD_FILE   = '/tmp/mixer_cmd.json'    # We write commands for mixer here
+KEYPAD_SOCKET    = '/tmp/keypad_cue.sock'   # side_keypad.py patch cue storage
 
 # =============================================================================
 # SOCKET SETUP
@@ -157,6 +158,17 @@ def write_mixer_cmd(cmd):
     with open(MIXER_CMD_FILE, 'w') as f:
         json.dump(cmd, f)
 
+
+def send_keypad_cmd(cmd):
+    """Send a video-patch cue save/load event to the side keypad service."""
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+    try:
+        sock.sendto(json.dumps(cmd).encode(), KEYPAD_SOCKET)
+    except OSError as error:
+        print("Keypad command failed: {}".format(error))
+    finally:
+        sock.close()
+
 # =============================================================================
 # COMMAND HANDLER
 # =============================================================================
@@ -189,14 +201,26 @@ def handle_command(cmd):
         write_cmd({"action": "loop_on"})
     elif cmd == "LOOP_OFF":
         write_cmd({"action": "loop_off"})
+    elif cmd.startswith("PLAYLOOP:"):
+        # Jump to clip and set loop state atomically (from patch load)
+        parts = cmd.split(':')
+        index = int(parts[1])
+        loop = int(parts[2]) == 1
+        write_cmd({"action": "play_loop", "index": index, "loop": loop})
     elif cmd.startswith("PLAY:"):
         # Jump to specific clip by index
         index = int(cmd.split(':')[1])
         write_cmd({"action": "play_index", "index": index})
+    elif cmd.startswith("CUES_SAVE:"):
+        slot = max(0, min(31, int(cmd.split(':')[1])))
+        send_keypad_cmd({"action": "save_patch", "slot": slot})
+    elif cmd.startswith("CUES_LOAD:"):
+        slot = max(0, min(31, int(cmd.split(':')[1])))
+        send_keypad_cmd({"action": "load_patch", "slot": slot})
 
     # --- Mixer channel commands (-> mixer.py) ---
     elif cmd.startswith("CH_A:"):
-        # Set channel A source (0=clips, 1-3=composite, 4=oscilloscope)
+        # Set channel A source (0=clips, 1-3=composite, 4=EXT USB, 5+=math)
         write_mixer_cmd({"action": "ch_a", "value": int(cmd.split(':')[1])})
     elif cmd.startswith("CH_B:"):
         # Set channel B source
@@ -210,7 +234,7 @@ def handle_command(cmd):
         # Set luma key low threshold (pixels below this are keyed out)
         write_mixer_cmd({"action": "luma", "value": int(cmd.split(':')[1])})
     elif cmd.startswith("LUMA_SRC:"):
-        # Set luma key source (0=none, 1=clips, 2-4=composite)
+        # Set luma key source (0=none, then channel-source index + 1)
         write_mixer_cmd({"action": "luma_src", "value": int(cmd.split(':')[1])})
     elif cmd.startswith("LUMA_HIGH:"):
         # Set luma key high threshold (for band keying)
@@ -237,12 +261,14 @@ def watch_status():
         PAUSE:0/1      - When pause state changes
         LOOP:0/1       - When loop state changes
         PROGRESS:p:d   - Every second during playback (position:duration)
+        EXT_USB:0/1    - When EXT USB availability changes
     """
     # Track last known state to detect changes
     last_index    = None
     last_paused   = None
     last_loop     = None
     last_time_pos = None
+    last_ext_usb  = None
     clips = get_clips()
 
     while True:
@@ -286,6 +312,15 @@ def watch_status():
                     if last_time_pos is None or abs(time_pos - last_time_pos) >= 1:
                         last_time_pos = time_pos
                         send_msg("PROGRESS:{}:{}".format(int(time_pos), int(duration)))
+
+            # Check mixer state for EXT USB availability
+            if os.path.exists(MIXER_STATE_FILE):
+                with open(MIXER_STATE_FILE) as f:
+                    mixer_state = json.load(f)
+                ext_usb = mixer_state.get('ext_usb_available', False)
+                if ext_usb != last_ext_usb:
+                    last_ext_usb = ext_usb
+                    send_msg("EXT_USB:{}".format(1 if ext_usb else 0))
 
         except Exception as e:
             print("Watch error: {}".format(e))

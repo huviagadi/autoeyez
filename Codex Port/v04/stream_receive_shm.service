@@ -1,0 +1,18 @@
+[Unit]
+Description=Raw YUV420p Video Stream Receiver (shmsink)
+After=network.target
+
+[Service]
+ExecStartPre=/bin/rm -f /tmp/video_shm
+ExecStart=/usr/bin/gst-launch-1.0 \
+    tcpserversrc host=0.0.0.0 port=1237 \
+    ! rawvideoparse format=i420 width=720 height=480 framerate=30/1 \
+    ! videoconvert \
+    ! video/x-raw,format=RGB,width=720,height=480,framerate=30/1 \
+    ! shmsink socket-path=/tmp/video_shm wait-for-connection=false shm-size=20000000
+Restart=always
+RestartSec=2
+User=admin
+
+[Install]
+WantedBy=multi-user.target

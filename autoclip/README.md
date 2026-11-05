@@ -1,89 +1,27 @@
-# autoclip — Video Clip Player & Mixer
+# autoclip
 
-Raspberry Pi 5-based video clip player and composite video mixer for the autoeyez system. Captures 3 composite video sources, plays MP4 clips, composites with crossfade and luma keying, and streams to autowaaave.
+Autoclip is the video source and mixer Pi in AutoEyez. The current root source
+has a PyAV clip player (`video_player.py`), an FFmpeg/V4L2 capture and
+composition loop (`mixer.py`), and a UDP command/status bridge
+(`video_control.py`). The mixer builds 720×576 RGB frames, crossfades A/B,
+optionally overlays a luma-key source, and writes a local framebuffer preview.
+It scales the network feed to 720×480.
 
-## Features
+`video.service` selects the raw YUV420p route on TCP 1237. The staged
+`../codec_mosh_trial_20261104/` source and overrides implement an Annex B
+H.264 route on TCP 1238. Sender and receiver must use the same route.
 
-- **MP4 clip playback** from SD card with loop, pause, seek
-- **3 composite capture inputs** via USB capture cards
-- **Real-time compositing** — crossfade between any two sources
-- **Luma keying** with adjustable low/high thresholds
-- **TCP video streaming** to autowaaave (720×480 H.264)
-- **UDP command interface** for remote control from automidi
+Clips live in `/home/admin/clips/`; `video_player.py` prefers matching seek
+copies under `/home/admin/clips_seek/`. Capture devices use stable
+`/dev/v4l/by-path/` names configured in `mixer.py`. The Akai Force connects
+through the MIDI gadget configured by `setup_midi_gadget.sh` and is handled by
+`force_cc_forward.py`.
 
-## Video Sources
+The controller firmware lists 26 source choices, while root `mixer.py`
+dispatches only indices 0–15. Staged mixer sources contain later variants;
+inspect the installed Pi before changing source menus. `side_keypad.py`
+imports modules absent from this root directory, so its deployed module set
+must also be checked.
 
-| Index | Source | Backend |
-|-------|--------|---------|
-| 0 | CLIPS | VideoPlayer (MP4 files) |
-| 1 | COMPOSITE 1 | /dev/video0 capture |
-| 2 | COMPOSITE 2 | /dev/video2 capture |
-| 3 | COMPOSITE 3 | /dev/video4 capture |
-
-## Architecture
-
-Three Python scripts work together:
-
-### mixer.py (main process)
-- Owns the compositing pipeline
-- Blends sources based on mix value
-- Applies luma keying
-- Writes to local framebuffer and TCP stream
-- Polls command file for mixer settings
-
-### video_player.py
-- Manages MP4 playback via ffmpeg subprocess
-- Handles play, pause, loop, seek, clip switching
-- Writes state to JSON for status reporting
-
-### video_control.py
-- Bridges network commands to IPC files
-- Receives UDP commands from automidi (via autowaaave bridge)
-- Sends state updates back (clip list, position, status)
-
-## Network
-
-| Direction | Protocol | Port | Purpose |
-|-----------|----------|------|---------|
-| autoclip → autowaaave | TCP | 1236 | H.264 video stream |
-| autowaaave → autoclip | UDP | 5006 | Commands |
-| autoclip → autowaaave | UDP | 5005 | State updates |
-
-**Static IP:** 10.0.0.2
-
-## Commands
-
-| Command | Action |
-|---------|--------|
-| NEXT / PREV | Navigate clips |
-| PLAY / PAUSE | Playback control |
-| LOOP_ON / LOOP_OFF | Toggle loop |
-| PLAY:n | Jump to clip index n |
-| CH_A:n / CH_B:n | Set mixer channel source |
-| MIX:n | Crossfade value (0-127) |
-| LUMA:n | Luma key low threshold |
-| LUMA_HIGH:n | Luma key high threshold |
-| LUMA_SRC:n | Luma key source index |
-| LUMA_HIGH_EN:n | Enable/disable high cut |
-
-## Clip Storage
-
-Clips are stored at `/boot/firmware/clips/` as MP4 files.
-
-Naming convention: `NN_CLIPNAME.mp4` where NN is sort order prefix.
-Display name strips prefix and extension, converts to uppercase.
-
-Example: `01_coolclip.mp4` → displays as "COOLCLIP"
-
-## Files
-
-- `mixer.py` — Main compositor, framebuffer output, stream
-- `video_player.py` — Clip playback engine
-- `video_control.py` — Command/state bridge
-- `video.service` — systemd unit (runs mixer.py as root)
-- `BUILDME.md` — Capture card details, Pi setup
-
-## See Also
-
-- `BUILDME.md` for capture card compatibility and setup
-- Parent `README.md` for system overview
+See [the system architecture](../ARCHITECTURE.md) for interfaces, ports, and
+the boundary between repository source and live device state.

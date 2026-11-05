@@ -1,0 +1,13 @@
+[Unit]
+Description=Clean HiFiBerry line input to external HDMI audio
+After=sound.target
+
+[Service]
+Type=simple
+User=admin
+ExecStart=/usr/bin/alsaloop -C default -P autoeyez_hdmi_volume -f S16_LE -c 2 -r 44100 -t 100000 -S 3
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

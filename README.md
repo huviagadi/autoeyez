@@ -1,197 +1,85 @@
-# autoeyez — Modular Video Synthesis System
+# AutoEyez
 
-**Version 0.2.0**
+AutoEyez is a live video instrument built from a Teensy controller and two
+Raspberry Pis. Autoclip plays clips, captures composite video, generates
+sources, and mixes the image. Autowaaave applies GPU feedback and effects
+and sends the result to HDMI. The controller supplies hands-on parameters,
+patches, and audio analysis. See [ARCHITECTURE.md](ARCHITECTURE.md) for the
+source-based system map and the distinction between repository variants and
+verified device state.
 
-A three-component real-time video synthesis and feedback system built around Raspberry Pi and Teensy hardware. Designed for live visual performance with hands-on control.
-
-## System Overview
-
-autoeyez combines hardware video mixing, GPU shader processing, and tactile MIDI control into a unified instrument for creating psychedelic video feedback effects, clip playback, and live composite video manipulation.
-
-```mermaid
-flowchart TB
-    subgraph automidi[automidi - Teensy 4.1]
-        ENC[9 Encoders + OLEDs]
-        BTN[12 Buttons + 8 LEDs]
-        FFT[Audio FFT Display]
-    end
-
-    subgraph autowaaave[autowaaave - Pi 3B+]
-        BRIDGE[video_bridge.py]
-        SHADER[openFrameworks Shaders]
-        AUDIO[HiFiBerry Line-In]
-    end
-
-    subgraph autoclip[autoclip - Pi 5]
-        PLAYER[Clip Player]
-        MIXER[Video Mixer]
-        CAPTURE[3x Composite Capture]
-    end
-
-    subgraph external[External]
-        SOURCES[Video Sources]
-        HDMI[HDMI Output]
-    end
-
-    automidi -->|USB MIDI| SHADER
-    automidi -->|USB Serial| BRIDGE
-    BRIDGE -->|UDP to Serial| automidi
-
-    BRIDGE ---|UDP Cmds/State| autoclip
-
-    SOURCES --> CAPTURE
-    PLAYER --> MIXER
-    CAPTURE --> MIXER
-    MIXER -->|TCP Video| SHADER
-    SHADER --> HDMI
-
-    AUDIO --> SHADER
-```
-
-**Data Flow:**
-- **MIDI CC** → Teensy sends shader parameters to autowaaave via USB MIDI
-- **Commands** → Teensy sends clip/mixer commands through autowaaave's serial→UDP bridge to autoclip
-- **State** → autoclip sends playback state through autowaaave's UDP→serial bridge back to Teensy OLEDs
-- **Video** → autoclip streams composited video to autowaaave via TCP (port 1236)
-- **Output** → autowaaave applies shader effects and outputs to HDMI
+The renderer is based on Andrei Jay's [auto_waaave](https://github.com/ex-zee-ex/auto_waaave).
 
 ## Components
 
-### automidi (Teensy 4.1)
-Hardware MIDI controller with 9 rotary encoders, 9 OLED displays, 12 buttons, and 8 LEDs. Sends MIDI CC to autowaaave for shader control and serial commands to autoclip for clip/mixer control. Features audio-reactive FFT visualization, patch save/load, and multi-page parameter layouts.
+| Directory | Purpose |
+| --- | --- |
+| `automidi/auto_midi_v0911/` | Teensy 4.1 firmware, audio FFT, OLED and encoder UI, SD patches |
+| `autoclip/` | Python clip player, composite capture, mixer, generated sources, MIDI gadget |
+| `autowaaave/` | openFrameworks renderer source, shaders, serial bridge, audio services |
+| `Codex Port/v04/` | Pi 5 renderer and raw shared-memory receiver port |
+| `codec_mosh_trial_20261104/` | Annex B H.264 sender, bounded damage proxy, receiver overrides |
+| `patch_codec_compat_20261105/` | Patch schema and transport compatibility work |
 
-### autowaaave (Raspberry Pi 3B+)
-openFrameworks application running GPU fragment shaders for real-time video feedback processing. Receives video stream from autoclip, applies spatial transforms, color manipulation, luma keying, temporal filtering, and outputs to HDMI. Audio-reactive parameters modulated by FFT analysis of line input. **Based on [auto_waaave](https://github.com/ex-zee-ex/auto_waaave) by Andrei Jay.**
+The source tree also contains dated stages and recovery copies. A stage is
+not automatically the installed version. Compare files with each Pi before
+deployment.
 
-### autoclip (Raspberry Pi 5)
-Video clip player and hardware mixer. Plays MP4 clips from SD card, captures 3 composite video sources via USB capture cards, composites them with crossfade and luma keying, and streams the result to autowaaave over TCP.
+## Connections
 
-## Signal Flow
+- Teensy USB MIDI and serial connect to autowaaave. MIDI carries renderer
+  controls and FFT bands; serial carries clip/mixer commands and state.
+- The Pis use direct Ethernet, with source defaults of `10.0.0.1` for
+  autowaaave and `10.0.0.2` for autoclip.
+- Composite capture dongles and the optional external USB source connect
+  to autoclip. Its mixer also plays MP4 files from `/home/admin/clips/`.
+- Autowaaave receives the mixed video through GStreamer shared memory,
+  renders the final image, and outputs HDMI.
+- An Akai Force can connect to autoclip's USB MIDI gadget for cues and
+  an additional parameter-offset layer.
 
-```mermaid
-flowchart LR
-    subgraph sources[Video Sources]
-        COMP1[Composite 1]
-        COMP2[Composite 2]
-        COMP3[Composite 3]
-        CLIPS[(MP4 Clips)]
-    end
+## Software setup
 
-    subgraph autoclip[autoclip - Pi 5]
-        CAP[USB Capture]
-        PLAY[Clip Player]
-        MIX[Video Mixer]
-        ENC[H.264 Encode]
-    end
+This repository is a source and deployment reference, not a single-command
+installer. The service examples assume Raspberry Pi OS, Python 3, FFmpeg,
+GStreamer, openFrameworks, and the hardware interfaces above. The Python
+mixer uses NumPy, OpenCV, and PyAV; generated GPU sources may use ModernGL.
+The controller builds with Teensyduino, Teensy Audio, Encoder, Adafruit GFX,
+and Adafruit SSD1306.
 
-    subgraph autowaaave[autowaaave - Pi 3B+]
-        DEC[Decode Stream]
-        FB[Feedback Buffer]
-        SHADER[GPU Shaders]
-        SHARP[Sharpen]
-    end
+1. Build and flash the firmware in `automidi/auto_midi_v0911/` for Teensy
+   4.1 with USB MIDI and serial enabled.
+2. Put clips in `/home/admin/clips/` on autoclip. Configure capture device
+   paths in `autoclip/mixer.py` to match the connected USB ports.
+3. Install the chosen autoclip mixer/player/control scripts and their
+   systemd units. Configure the USB MIDI gadget if using the Force.
+4. Build the chosen Pi 5 openFrameworks renderer with its matching shaders.
+   Install a matching video receiver and `video_bridge.py`.
+5. Select **one** matching stream route: raw YUV420p on TCP 1237, or the
+   Annex B codec path through TCP 1238 and local TCP 1239. Check the
+   sender and receiver service overrides together.
+6. Confirm video in `/tmp/video_shm`, Teensy MIDI and serial, renderer HDMI,
+   clip commands, and the chosen audio route.
 
-    HDMI[HDMI Display]
+For the detailed code paths and service names, use [ARCHITECTURE.md](ARCHITECTURE.md).
+Older build guides in the tree include Pi 3B+ instructions and should be
+checked against the selected Pi 5 source before use.
 
-    COMP1 --> CAP
-    COMP2 --> CAP
-    COMP3 --> CAP
-    CLIPS --> PLAY
+## Customization
 
-    CAP --> MIX
-    PLAY --> MIX
-    MIX --> ENC
-    ENC -->|TCP 1236| DEC
+- `autoclip/mixer.py`: source selection, capture paths, mixer behavior,
+  stream host and port defaults.
+- `autoclip/video_player.py`: clip directory, playback, seek, stutter.
+- `autoclip/gpu_shader_sources.py` and `autoclip/queued_shaders/`:
+  generated video sources.
+- `automidi/auto_midi_v0911/auto_midi_v0911.ino`: controller menus,
+  MIDI mappings, page behavior, and audio controls.
+- Renderer `ofApp.cpp` and matching `shadersES2/`: feedback and effects.
+- `autowaaave/video_bridge.py`: serial/UDP control addresses and ports.
+- Service unit files and overrides: process startup and transport route.
 
-    DEC --> FB
-    FB --> SHADER
-    SHADER --> SHARP
-    SHARP --> HDMI
-    SHADER -.-> FB
-```
-
-| Stage | Device | Resolution | Process |
-|-------|--------|------------|---------|
-| 1. Capture | autoclip | 640×480 | USB capture cards decode composite video (MJPEG) |
-| 2. Playback | autoclip | 720×576 | MP4 clips decoded via ffmpeg |
-| 3. Mixing | autoclip | 720×480 | A/B crossfade + luma key compositing |
-| 4. Streaming | autoclip→autowaaave | 720×480 | H.264 encode → TCP (port 1236) |
-| 5. Processing | autowaaave | 720×480 | GPU shaders: UV warp, HSB, temporal filter |
-| 6. Feedback | autowaaave | 720×480 | 60-frame circular buffer (2 sec delay) |
-| 7. Output | autowaaave | 1280×720 | Upscaled to 720p HDMI |
-
-## Features
-
-- **GPU video feedback** with zoom, rotate, translate, hue shift
-- **Luma keying** with adjustable threshold and source selection
-- **Temporal filtering** with 60-frame delay buffer (2 seconds)
-- **3 composite capture inputs** for external video sources
-- **Clip playback** with loop, pause, and instant switching
-- **9 parameter encoders** with visual feedback on OLEDs
-- **32 video patches** + 32 audio-reactive patches (save/load)
-- **Audio-reactive modulation** — FFT low/mid/high bands
-- **Live performance ready** — boots to operational state
-
-## Directory Structure
-
-```
-autoeyez/
-├── README.md           # This file
-├── BUILDME.md          # Hardware build overview
-├── automidi/           # Teensy MIDI controller
-│   ├── README.md
-│   ├── BUILDME.md      # Detailed hardware build
-│   └── auto_midi_v0911/
-├── autoclip/           # Pi 5 clip player + mixer
-│   ├── README.md
-│   ├── BUILDME.md      # Capture cards, peripherals
-│   └── *.py, *.service
-├── autowaaave/         # Pi 3B+ shader processor
-│   ├── README.md
-│   ├── BUILDME.md      # Pi setup, HiFiBerry
-│   └── *.cpp, *.py, *.service
-└── deprecated/         # Old/unused code
-```
-
-## Quick Start
-
-See `BUILDME.md` for full hardware assembly instructions.
-
-1. Build the automidi controller (Teensy + encoders + displays)
-2. Set up autoclip Pi 5 with capture cards
-3. Set up autowaaave Pi 3B+ with HiFiBerry
-4. Connect automidi to autowaaave via USB (provides both MIDI and serial)
-5. Connect autowaaave to autoclip via direct ethernet (10.0.0.1 ↔ 10.0.0.2)
-6. Power on all three — system auto-syncs on boot
-
-**Note:** The Teensy has no direct connection to autoclip. All communication flows through autowaaave's video_bridge.py which translates serial↔UDP.
-
-## Changelog
-
-### v0.2.0 (2026-05-19)
-- Upgraded processing resolution from 640x480 to 720x480
-- Native 720x480 capture with no scaling artifacts
-- Fixed v4l2loopback freeze issue (max_buffers=2)
-- HDMI output at 720p for LZX Videomancer compatibility
-- Added thread coordination for clip playback
-
-### v0.1.0 (2026-05-16)
-- Initial public release
-- automidi 9-encoder MIDI controller with OLEDs
-- autowaaave GPU shader feedback processor
-- autoclip video mixer with 3 composite inputs
-- 32 video patches + 32 audio-reactive patches
-- P-lock parameter automation (8-second loop)
-
-## Roadmap
-
-Potential future improvements:
-
-- **Higher resolution processing** — Test 960x540 or 1280x720 on Pi 3B+
-- **Pi 4/5 port** — Unlock higher resolutions and framerates
-- **Additional shader effects** — Edge detection, pixelation, color quantization
-- **LFO modulation** — USB MIDI-synced LFOs for parameter automation
-- **Recording** — Capture output to SD card (if CPU headroom allows)
+Local clip media, compiled binaries, generated previews, and machine-specific
+credentials are intentionally excluded from the repository.
 
 ## License
 

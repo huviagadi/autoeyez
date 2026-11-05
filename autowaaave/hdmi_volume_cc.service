@@ -1,0 +1,13 @@
+[Unit]
+Description=Force Q-Link HDMI volume offset receiver
+After=sound.target network.target
+
+[Service]
+Type=simple
+User=admin
+ExecStart=/usr/bin/python3 /home/admin/hdmi_volume_cc.py
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

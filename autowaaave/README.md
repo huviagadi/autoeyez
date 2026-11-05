@@ -1,93 +1,29 @@
-# autowaaave — GPU Shader Video Processor
+# autowaaave
 
-Raspberry Pi 3B+ running openFrameworks for real-time GPU video feedback processing. The visual heart of the autoeyez system — receives video from autoclip, applies shader effects, outputs to HDMI.
+Autowaaave is AutoEyez's openFrameworks renderer and controller bridge.
+It receives autoclip video through a GStreamer shared-memory socket,
+combines it with GPU feedback history, applies color, geometry, temporal,
+and post effects, and outputs HDMI. The renderer is based on Andrei Jay's
+[auto_waaave](https://github.com/ex-zee-ex/auto_waaave).
 
-**Based on [auto_waaave](https://github.com/ex-zee-ex/auto_waaave) by Andrei Jay (ex-zee-ex)** — forked from version 1.5 and modified for integration with the autoeyez control system.
+This directory contains source from different generations. Root
+`ofApp.cpp` and `autowaaave.service` retain earlier paths. Pi 5 source
+and services appear in `../Codex Port/v04/`, `pi5_port/`, and newer staged
+directories such as `peek_menu_fix_20261026/`. The Pi 5 renderer uses a
+720×480 video input, a 1920×1080 canvas, and a 30-frame feedback ring in
+the inspected source. Match the renderer binary, shaders, and receiver
+service when deploying.
 
-## Features
+`video_bridge.py` connects to Teensy USB serial at `/dev/ttyACM0`,
+forwards commands to autoclip on UDP 5006, and returns state from UDP 5005.
+Renderer parameters and FFT bands also arrive through USB MIDI. Force
+offset controls arrive from autoclip on UDP 5010. Optional HiFiBerry
+capture-to-HDMI audio runs through `alsaloop.service` and `hdmi_audio.py`.
 
-- **GPU fragment shader** video feedback pipeline
-- **Spatial transforms** — zoom, rotate, translate, mirror, toroidal wrap
-- **Color manipulation** — hue shift, saturation, brightness, invert
-- **Luma keying** — composite camera over feedback based on brightness
-- **Temporal filtering** — blend with delayed frames
-- **60-frame delay buffer** (2 seconds at 30fps)
-- **Wet/dry feedback** — true feedback loop or simple delay
-- **Audio-reactive modulation** via FFT (low/mid/high bands)
-- **Sharpening** post-process
-- **MIDI control** of all parameters
+The raw video receiver listens on TCP 1237. The codec-damage variant in
+`../codec_mosh_trial_20261104/` listens through a proxy on TCP 1238 and
+feeds a local decoder on TCP 1239. Both routes produce
+`/tmp/video_shm` for the renderer. Select one matching sender/receiver pair.
 
-## Pipeline
-
-```
-Video from autoclip (TCP:1236)
-        ↓
-    /dev/video10 (v4l2loopback)
-        ↓
-    cam1 (OF VideoGrabber)
-        ↓
-    shader_mixer.frag
-    - Read feedback frame from pastFrames[delay]
-    - Apply spatial transform (zoom, rotate, translate)
-    - Apply color transform (hue, sat, bright)
-    - Luma key with camera
-    - Temporal filter blend
-        ↓
-    shaderSharpen
-        ↓
-    HDMI Output
-        ↓
-    Write to pastFrames ring buffer
-```
-
-## Resolution
-
-- Input: 720×480 from autoclip
-- Processing: 720×480 @ 30fps (internal FBOs)
-- Output: 1280×720 HDMI (upscaled)
-
-## Shader Parameters
-
-| Parameter | MIDI CC | Type | Description |
-|-----------|---------|------|-------------|
-| Luma Key | CC16 | unipolar | Threshold for keying |
-| FB Mix | CC17 | bipolar | Camera ↔ feedback blend |
-| Hue | CC18 | bipolar | Hue rotation |
-| Saturation | CC19 | bipolar | Saturation adjust |
-| Brightness | CC20 | bipolar | Brightness adjust |
-| Temporal Mix | CC21 | bipolar | Current ↔ delayed blend |
-| Temporal Res | CC22 | unipolar | Temporal intensity |
-| Sharpen | CC23 | unipolar | Sharpening amount |
-| X Displace | CC120 | bipolar | Horizontal offset |
-| Y Displace | CC121 | bipolar | Vertical offset |
-| Z Displace | CC122 | bipolar | Zoom/scale |
-| Rotate | CC123 | bipolar | Rotation angle |
-| Hue Modulo | CC124 | unipolar | Hue chaos divisor |
-| Hue Offset | CC125 | bipolar | Hue chaos offset |
-| Hue LFO | CC126 | bipolar | Hue oscillation |
-| Delay Time | CC127 | unipolar | Frames back in buffer |
-
-## Services
-
-| Service | Purpose |
-|---------|---------|
-| stream_receive | Receives TCP stream, writes to v4l2loopback |
-| autowaaave | Main openFrameworks application |
-| video_bridge | Serial↔UDP bridge for automidi communication |
-
-## Files
-
-- `ofApp.cpp` / `ofApp.h` — openFrameworks application
-- `video_bridge.py` — Serial/UDP bridge
-- `autowaaave.service` — Main app service
-- `stream_receive.service` — Video receiver service
-- `video_bridge.service` — Bridge service
-- `asound.conf` — ALSA config for HiFiBerry
-- `config.txt` — Boot configuration
-- `BUILDME.md` — Pi setup, HiFiBerry installation
-
-## See Also
-
-- `BUILDME.md` for Raspberry Pi and HiFiBerry setup
-- `NOTES.md` for detailed shader parameter reference
-- Parent `README.md` for system overview
+See [the system architecture](../ARCHITECTURE.md) for the full signal flow
+and deployment caveats.

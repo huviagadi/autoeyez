@@ -42,8 +42,10 @@ Note: serial bridge (serial → UDP) likely lives in video_bridge.py on autowaaa
 
 ## Network
 - autowaaave IP: 10.0.0.1
-- autoclip streams video to autowaaave: tcp://10.0.0.1:1236 (H.264, mpegts, ~8Mbps)
-- Stream: 720×576 captured → scaled 720×480, yuv420p, libx264, preset faster, crf 18
+- autoclip streams video to autowaaave: tcp://10.0.0.1:1237 (raw YUV420p, ~124 Mbps)
+- Stream: 720×576 RGB composite → scaled 720×480 → planar YUV420p on the wire
+- autowaaave parses I420 frames, converts to 720×480 RGB, and writes `/tmp/video_shm` for openFrameworks
+- Set `AUTOEYEZ_STREAM_FORMAT=h264` and port `1236` to use the previous sender format during rollback
 - Stream auto-reconnects on disconnect
 
 ## Sources (5 total)
@@ -53,7 +55,7 @@ Note: serial bridge (serial → UDP) likely lives in video_bridge.py on autowaaa
 | 1     | COMPOSITE 1  | /dev/video0 (CaptureChannel)   |
 | 2     | COMPOSITE 2  | /dev/video2 (CaptureChannel)   |
 | 3     | COMPOSITE 3  | /dev/video4 (CaptureChannel)   |
-| 4     | OSCILLOSCOPE | blank frame (disabled)         |
+| 4     | EXT USB      | /dev/video6 (hot-swappable)    |
 
 ## Compositing Pipeline
 1. Get frame_a (ch_a source) — always
@@ -119,13 +121,11 @@ Naming conventions to be cleaned up later.
 
 ## Known Issues / Bugs
 - Duplicate `elif action == 'luma':` in mixer.py `handle_cmd()` — second block is dead code; first block wins but doesn't call `write_state()`
-- OscilloscopeChannel instantiated but never started (`self.osc.start()` commented out) — SRC_OSCILLOSCOPE always returns blank frame
 - `pad` flag in CaptureChannel is set True for all devices but vf string is identical regardless — no actual padding/letterbox logic implemented
 
 ## Potential Changes / TODOs
 - Fix duplicate luma handler in mixer.py — consolidate into one block that calls write_state()
 - Clean up SRC_COMPOSITE3 "dummy" label and comment — rename to reflect it's a real capture
-- Decide on oscilloscope: either wire it up properly or remove the dead class
 - Investigate whether pad=True should produce letterboxed 720×576 from 640×480 input (add padding bars vs. stretch)
 - Consider replacing /tmp JSON file polling IPC with something lower-latency (e.g. Unix socket or named pipe) — current 10ms poll on cmd files adds latency
 - Clip naming convention cleanup (prefix stripping logic is fragile)

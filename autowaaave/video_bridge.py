@@ -36,6 +36,8 @@ import time
 import threading
 import serial
 import subprocess
+import os
+from hdmi_audio import handle_audio_pass
 
 # =============================================================================
 # CONFIGURATION
@@ -49,6 +51,16 @@ BAUD         = 115200
 PI2_IP       = '10.0.0.2'    # autoclip IP address
 LISTEN_PORT  = 5005          # Port we listen on for state updates from autoclip
 PI2_CMD_PORT = 5006          # Port autoclip listens on for commands
+
+# FFT file paths (shared with AUTO_WAAAVE)
+FFT_FILE     = '/dev/shm/fft_values'
+FFT_SMOOTH   = '/dev/shm/fft_smooth'
+FFT_ATTACK   = '/dev/shm/fft_attack'
+FFT_DECAY    = '/dev/shm/fft_decay'
+FFT_BDECAY   = '/dev/shm/fft_bdecay'
+FFT_HIT      = '/dev/shm/fft_hit'
+FFT_SLIDE    = '/dev/shm/fft_slide'
+FFT_ENV_UPDATE = '/dev/shm/fft_env_update'  # Written by autowaaave on audio patch load
 
 # =============================================================================
 # SOCKET SETUP
@@ -144,10 +156,30 @@ def serial_to_pi2():
                 char = ser.read().decode('utf-8', errors='ignore')
 
                 if char == '\n':
-                    # Complete line received - forward it
-                    if buf.strip():
-                        print("Teensy->Pi2: {}".format(buf))
-                        send_to_pi2(buf.strip())
+                    # Complete line received - process or forward it
+                    line = buf.strip()
+                    if line:
+                        # Intercept FFT commands (don't forward to Pi2)
+                        if line.startswith("FFT:"):
+                            handle_fft(line)
+                        elif line.startswith("FFT_SMOOTH:"):
+                            handle_fft_param(line, FFT_SMOOTH)
+                        elif line.startswith("FFT_ATTACK:"):
+                            handle_fft_param(line, FFT_ATTACK)
+                        elif line.startswith("FFT_DECAY:"):
+                            handle_fft_param(line, FFT_DECAY)
+                        elif line.startswith("FFT_BDECAY:"):
+                            handle_fft_param(line, FFT_BDECAY)
+                        elif line.startswith("FFT_HIT:"):
+                            handle_fft_param(line, FFT_HIT)
+                        elif line.startswith("FFT_SLIDE:"):
+                            handle_fft_param(line, FFT_SLIDE)
+                        elif line.startswith("AUDIO_PASS:"):
+                            handle_audio_pass(line)
+                        else:
+                            # Forward other commands to autoclip
+                            print("Teensy->Pi2: {}".format(line))
+                            send_to_pi2(line)
                     buf = ''
                 else:
                     buf += char
@@ -257,6 +289,75 @@ def handle_midi():
             time.sleep(2)  # Wait before retry
 
 # =============================================================================
+# FFT DATA HANDLING
+# =============================================================================
+
+def handle_fft(cmd):
+    """
+    Write FFT band values to file for AUTO_WAAAVE to read.
+    Format: "FFT:low,mid,high" → writes "low mid high" to file
+    Uses atomic write (write to temp, then rename) to prevent race conditions.
+    """
+    try:
+        parts = cmd[4:].split(",")
+        if len(parts) == 3:
+            tmp_path = FFT_FILE + ".tmp"
+            with open(tmp_path, "w") as f:
+                f.write("{} {} {}".format(parts[0], parts[1], parts[2]))
+            os.rename(tmp_path, FFT_FILE)
+    except Exception as e:
+        print("FFT write error: {}".format(e))
+
+
+def handle_fft_param(cmd, filepath):
+    """
+    Write FFT parameter value to file.
+    Format: "FFT_XXX:value" → writes "value" to file
+    """
+    try:
+        val = cmd.split(":")[1]
+        with open(filepath, "w") as f:
+            f.write(val)
+    except Exception as e:
+        print("FFT param write error: {}".format(e))
+
+
+# =============================================================================
+# ENVELOPE SYNC (Pi → Teensy)
+# =============================================================================
+
+def monitor_env_update():
+    """
+    Monitor /dev/shm/fft_env_update for changes and send to Teensy.
+
+    When an audio patch loads in autowaaave, it writes the envelope values
+    to fft_env_update. This thread watches for changes and sends them
+    to the Teensy so its display and internal state stay in sync.
+
+    Format: "smooth,attack,decay,bdecay,hit,slide" (all 0-127)
+    Sends to Teensy as: ENV:smooth,attack,decay,bdecay,hit,slide
+    """
+    last_content = ""
+
+    while True:
+        try:
+            if os.path.exists(FFT_ENV_UPDATE):
+                with open(FFT_ENV_UPDATE, "r") as f:
+                    content = f.read().strip()
+
+                # Only send if content changed
+                if content and content != last_content:
+                    last_content = content
+                    # Send as single ENV: command (Teensy expects this format)
+                    cmd = "ENV:{}".format(content)
+                    ser.write((cmd + '\n').encode())
+                    print("Env sync: {}".format(cmd))
+        except Exception as e:
+            pass  # Silently ignore errors (file might not exist yet)
+
+        time.sleep(0.1)  # Check 10 times per second
+
+# =============================================================================
 # PROCESS DETECTION
 # =============================================================================
 
@@ -304,6 +405,7 @@ ser = get_serial()
 threading.Thread(target=wait_and_signal_ready, daemon=True).start()
 threading.Thread(target=listen_for_reboot, daemon=True).start()
 threading.Thread(target=udp_to_serial, daemon=True).start()
+threading.Thread(target=monitor_env_update, daemon=True).start()
 
 # Run serial→UDP forwarding in main thread (blocks forever)
 serial_to_pi2()

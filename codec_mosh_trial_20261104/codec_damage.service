@@ -1,0 +1,13 @@
+[Unit]
+Description=Autoeyez bounded H.264 codec damage proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 -u /home/admin/realtime_codec_damage.py
+Restart=always
+RestartSec=1
+User=admin
+
+[Install]
+WantedBy=multi-user.target

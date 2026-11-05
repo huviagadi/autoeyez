@@ -4,6 +4,8 @@ After=multi-user.target
 StartLimitIntervalSec=0
 
 [Service]
+Environment=AUTOEYEZ_STREAM_FORMAT=yuv420p
+Environment=AUTOEYEZ_STREAM_PORT=1237
 ExecStart=/usr/bin/python3 /home/admin/mixer.py
 Restart=always
 RestartSec=5

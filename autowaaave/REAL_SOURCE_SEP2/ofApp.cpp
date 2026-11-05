@@ -1,0 +1,3976 @@
+/*
+ * Copyright (c) 2013 Dan Wilcox <danomatika@gmail.com>
+ *
+ * BSD Simplified License.
+ * For information on usage and redistribution, and for a DISCLAIMER OF ALL
+ * WARRANTIES, see the file, "LICENSE.txt," in this distribution.
+ *
+ * See https://github.com/danomatika/ofxMidi for documentation
+ *
+ */
+
+/*
+ * =============================================================================
+ * autowaaave — GPU Video Feedback Processor
+ * Part of the autoeyez video synthesis system
+ * =============================================================================
+ *
+ * Based on auto_waaave v1.5 by Andrei Jay (ex-zee-ex)
+ * https://github.com/ex-zee-ex/auto_waaave
+ *
+ * This openFrameworks application runs on a Raspberry Pi 3B+ and performs
+ * real-time GPU-accelerated video processing with feedback effects.
+ *
+ * INTEGRATION WITH AUTOEYEZ:
+ *   Input:
+ *     - Video stream from autoclip (Pi 5) via TCP on port 1236
+ *     - MIDI CC messages from automidi (Teensy) via USB
+ *     - Audio from HiFiBerry line-in for FFT analysis
+ *
+ *   Output:
+ *     - HDMI to display/capture (processed video with effects)
+ *
+ *   Control flow:
+ *     automidi (Teensy)
+ *       → USB MIDI
+ *       → THIS APP (receives CC messages)
+ *       → GPU shader processing
+ *       → HDMI output
+ *
+ * KEY FEATURES:
+ *   - Video feedback with UV displacement (warp, zoom, rotate)
+ *   - HSB color manipulation (hue shift, saturation, brightness)
+ *   - Luma keying for compositing
+ *   - Temporal filtering (frame blending, resonance)
+ *   - Sharpening post-process
+ *   - Audio-reactive modulation (FFT low/mid/high bands)
+ *   - P-lock recording (parameter automation at 30fps × 8 seconds)
+ *   - 32 audio patches (stored on Pi)
+ *
+ * MIDI CC MAP (from automidi):
+ *   CC 2:    Fade to black
+ *   CC 7:    Audio input gain
+ *   CC 16:   Luma key threshold
+ *   CC 17:   Feedback mix
+ *   CC 18:   Hue shift
+ *   CC 19:   Saturation
+ *   CC 20:   Brightness (page 1) / Value (page 0)
+ *   CC 21:   Blur
+ *   CC 22:   Bloom
+ *   CC 23:   Sharpen
+ *   CC 91:   Patch load latch (127=start, 0=end)
+ *   CC 92:   Save audio patch (value = slot)
+ *   CC 93:   Load audio patch (value = slot)
+ *   CC 120-127: Spatial parameters (X/Y offset, zoom, rotate, hue mod/lfo/off)
+ *   + many more for toggles and multipliers (see midibiz function)
+ *
+ * P-LOCK SYSTEM:
+ *   Records parameter changes into a 240-step circular buffer running at 30fps.
+ *   This creates an 8-second automation loop that can be recorded live.
+ *   Each parameter (17 total) has its own lane in the p_lock array.
+ *
+ * FRAMEBUFFER SYSTEM:
+ *   Uses a circular buffer of 60 framebuffers for video delay/feedback.
+ *   At 30fps this provides 2 seconds of delay time.
+ *   The delay tap position is controlled by MIDI CC 127.
+ *
+ * =============================================================================
+ */
+
+#include "ofApp.h"
+#include <sys/stat.h>
+
+#include "iostream"
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+// MIDI center value for bipolar parameters (0-127 range, center at 63.5)
+#define MIDI_MAGIC 63.50f
+
+// Threshold for MIDI control "pick-up" (prevents jumps when knob doesn't match)
+#define CONTROL_THRESHOLD .035f
+
+// =============================================================================
+// CONFIGURATION FLAGS
+// =============================================================================
+
+// Resolution switch: 0 = 320×240 (lower res, more delay frames)
+//                    1 = 720×480 (higher res, standard delay)
+bool scaleswitch=1;
+
+// Frame buffer length for delay/feedback (60 frames @ 30fps = 2 seconds)
+const int framebufferLength=60;
+
+// =============================================================================
+// MIDI PATCH LOADING STATE
+// =============================================================================
+
+// When loading a patch, forceMidiWrite bypasses the pick-up threshold
+// so all parameter values are immediately applied
+bool forceMidiWrite = false ;
+unsigned long forceMidiWriteTimer = 0 ;
+unsigned long midiReconnectTimer = 0 ;
+
+// =============================================================================
+// FADE TO BLACK
+// =============================================================================
+
+// Blackout overlay controlled by CC 2 (for smooth fade transitions)
+float blackoutAmount = 0 ;
+float blackoutSmoothed = 0 ;
+
+// =============================================================================
+// INPUT AND OUTPUT MODES
+// =============================================================================
+
+// Input source: 0 = Pi camera, 1 = USB/network video input
+// For autoeyez, always 1 (video comes from autoclip via TCP)
+bool inputswitch=1;
+
+// Feedback mode:
+//   0 = Wet (internal feedback): output feeds back into itself
+//   1 = Dry (delay mode): input feeds delay buffer, no self-feedback
+bool wet_dry_switch=1;
+
+// External FFT mode:
+//   true = use CC110-112 from Teensy (via /dev/shm/fft_values)
+//   false = use local HiFiBerry audio input
+bool useExternalFFT = true ;
+
+// Aspect ratio handling:
+//   0 = SD 4:3 aspect (for composite/480i sources)
+//   1 = HD 16:9 corner crop (for HD sources)
+int hdmi_aspect_ratio_switch=0;
+
+// =============================================================================
+// SHADER PARAMETERS (base values from keyboard/direct control)
+// =============================================================================
+// These single-letter variables are legacy from auto_waaave keyboard mapping.
+// They're combined with p-lock and audio-reactive values in parametersAssign().
+
+float az = 1.0;   // Z displacement (zoom)
+float sx = 0;     // X displacement
+float dc = 0;     // Y displacement (d/c keys)
+float fv = 1;     // Hue attenuation
+float gb = 1;     // Saturation attenuation
+float hn = 1;     // Brightness attenuation
+float jm = 0.0;   // Feedback mix amount
+float kk = 0.0;   // Luma key threshold
+float ll = 0.0;   // Sharpen amount
+float qw = 0.0;   // Rotation
+float er = 1.0;   // Hue modulo
+float ty = 0.0;   // Hue offset
+float ui = 0.0;   // Hue LFO
+float op = 0.0;   // Temporal filter mix
+
+float fb1_brightx=0.0;
+bool toroidSwitch=0;
+bool y_skew_switch=FALSE;
+bool x_skew_switch=FALSE;
+bool lumakeyInvertSwitch=FALSE;
+bool x_mirrorSwitch=FALSE;
+bool y_mirrorSwitch=FALSE;
+float y_skew=0;
+float x_skew=0;
+bool mirrorSwitch=FALSE;
+
+int fb0_delayamount=0;
+
+//dummy variables for midi control
+
+int width=720;
+int height=480;
+
+
+// =============================================================================
+// AUDIO-REACTIVE MODULATION
+// =============================================================================
+// Each parameter can be modulated by FFT frequency bands (low/mid/high).
+// The automidi controller selects which band to assign via ring buttons.
+// lowCn, midCn, highCn are the modulation amounts for parameter n.
+
+// Audio reactive mode: 0=direct MIDI, 1=low band, 2=mid band, 3=high band
+int audioReactiveControlSwitch=0;
+
+// Low-frequency (bass) modulation amounts for each parameter
+float lowC1=0.0;
+float lowC2=0.0;
+float lowC3=0.0;
+float lowC4=0.0;
+float lowC5=0.0;
+float lowC6=0.0;
+float lowC7=0.0;
+float lowC8=0.0;
+float lowC9=0.0;
+float lowC10=0.0;
+float lowC11=0.0;
+float lowC12=0.0;
+float lowC13=0.0;
+float lowC14=0.0;
+float lowC15=0.0;
+float lowC16=0.0;
+
+float midC1=0.0;
+float midC2=0.0;
+float midC3=0.0;
+float midC4=0.0;
+float midC5=0.0;
+float midC6=0.0;
+float midC7=0.0;
+float midC8=0.0;
+float midC9=0.0;
+float midC10=0.0;
+float midC11=0.0;
+float midC12=0.0;
+float midC13=0.0;
+float midC14=0.0;
+float midC15=0.0;
+float midC16=0.0;
+
+float highC1=0.0;
+float highC2=0.0;
+float highC3=0.0;
+float highC4=0.0;
+float highC5=0.0;
+float highC6=0.0;
+float highC7=0.0;
+float highC8=0.0;
+float highC9=0.0;
+float highC10=0.0;
+float highC11=0.0;
+float highC12=0.0;
+float highC13=0.0;
+float highC14=0.0;
+float highC15=0.0;
+float highC16=0.0;
+
+// Mosh audio reactivity (parameter 17)
+float lowC17=0.0;
+float midC17=0.0;
+float highC17=0.0;
+
+bool clear_switch=0;
+//toggle switch variables
+bool hueInvert=FALSE;
+bool saturationInvert=FALSE;
+bool brightInvert=FALSE;
+
+bool cam1_h_invert=FALSE;
+bool cam1_s_invert=FALSE;
+bool cam1_b_invert=FALSE;
+
+bool horizontalMirror=FALSE;
+bool verticalMirror=FALSE;
+
+bool clear_flip=FALSE;
+
+bool x_2=FALSE;
+bool x_5=FALSE;
+bool x_10=FALSE;
+
+bool y_2=FALSE;
+bool y_5=FALSE;
+bool y_10=FALSE;
+
+bool z_2=FALSE;
+bool z_5=FALSE;
+bool z_10=FALSE;
+
+bool r_2=FALSE;
+bool r_5=FALSE;
+bool r_10=FALSE;
+
+bool huexx_0=FALSE;
+bool huexx_1=FALSE;
+bool huexx_2=FALSE;
+
+bool huexy_0=FALSE;
+bool huexy_1=FALSE;
+bool huexy_2=FALSE;
+
+bool huexz_0=FALSE;
+bool huexz_1=FALSE;
+bool huexz_2=FALSE;
+
+//framebuffer management biziness
+
+//framebufferLength is the total number of frames that will be stored.  setting framebufferLength to
+//30 while fps is set to 30 means 1 second of video will be stored in memory  
+//75 seems to work ok with usb cams but the capture device might need a little more memory
+
+int framedelayoffset=0;  // this is used as an index to the circular framebuffers eeettt
+unsigned int framecount=0; // framecounter used to calc offset eeettt
+
+//this is an array of framebuffer objects
+ofFbo pastFrames[framebufferLength];
+
+
+void incIndex()  // call this every frame to calc the offset eeettt
+{
+    framecount++;
+    framedelayoffset=framecount % framebufferLength;
+}
+
+// =============================================================================
+// P-LOCK (Parameter Lock) SYSTEM
+// =============================================================================
+// P-locks record parameter changes into a circular buffer for automation.
+// At 30fps with 240 steps, this creates an 8-second loop.
+// Each encoder parameter has its own lane in the p_lock array.
+// The automidi controller uses this for live recording of parameter automation.
+
+// Size of p-lock buffer (240 steps @ 30fps = 8 seconds)
+const int p_lock_size=240;
+
+// Master p-lock enable switch (CC 55)
+bool p_lock_switch=0;
+
+// Erase mode (clears p-lock buffer when enabled)
+bool p_lock_erase=0;
+
+// Number of p-lock lanes (one per recordable parameter)
+// Note: extra lane allocated due to array bounds quirk in original code
+const int p_lock_number=17;
+
+// 2D array storing recorded values: p_lock[parameter][timestep]
+float p_lock[p_lock_number][p_lock_size];
+
+// Smoothing factor for p-lock playback (0-1, higher = smoother)
+float p_lock_smooth=.25;
+
+// Smoothed p-lock values (output after interpolation)
+float p_lock_smoothed[p_lock_number];
+
+// Enable p-lock recording (usually always on)
+bool p_lock_0_switch=1;
+
+// Current position in p-lock buffer (0 to p_lock_size-1)
+int p_lock_increment=0;
+
+float my_normalize=0;
+
+float low_value_smoothed=0.0;
+float mid_value_smoothed=0.0;
+float high_value_smoothed=0.0;
+float smoothing_rate=.5;
+
+// Envelope params for external FFT - saved with audio patches
+float extSmooth = 0.3f, extAttack = 0.5f, extDecay = 0.8f, extBDecay = 0.8f ;
+float extHit = 0.75f, extSlide = 0.5f ;  // Transient: hit=jump amount, slide=slide-in rate
+bool fftParamsDirty = false ;  // Set true to force immediate re-read
+
+ofFbo aspect_fix_fbo;
+ofFbo dry_framebuffer;
+
+// Datamosh FBOs and state
+ofFbo moshAccum[2];       // Ping-pong accumulator
+ofFbo moshPrevFrame;      // Previous frame for motion estimation
+ofShader shaderMosh;      // Datamosh shader
+int moshPing = 0;         // Current accumulator index (0 or 1)
+float moshK = 1.0f;       // Residual gate: 1.0=bypass, 0.02=full mosh
+float moshBase = 0.0f;    // Base mosh amount (0-1) before audio
+float moshMvScale = 1.0f; // Motion vector scale
+float moshSatRestore = 1.08f;  // Saturation restoration (higher = more color)
+bool moshEnabled = false; // Quick toggle
+
+// Chromatic aberration
+ofShader shaderChroma;
+float chromaBase = 0.4f;  // Base chroma amount (0-1) before audio - default 40%
+float chromaAmount = 0.0f; // Final chroma amount after audio
+float lowC18 = 0.0f, midC18 = 0.0f, highC18 = 0.0f;  // Audio reactivity
+
+// Bit crush
+ofShader shaderCrush;
+float crushBase = 0.0f;   // Base crush amount (0-1) before audio
+float crushAmount = 0.0f; // Final crush amount after audio
+float lowC19 = 0.0f, midC19 = 0.0f, highC19 = 0.0f;  // Audio reactivity
+
+// Pixelize
+ofShader shaderPixel;
+float pixelBase = 0.1f;   // Base pixel amount (0-1) before audio - default 10%
+float pixelAmount = 0.0f; // Final pixel amount after audio
+float lowC20 = 0.0f, midC20 = 0.0f, highC20 = 0.0f;  // Audio reactivity
+
+// Startup ignore window for shader effects (Force sends spurious CCs on connect)
+float startupTime = 0.0f;
+const float STARTUP_IGNORE_SECS = 3.0f;
+
+// Post-process chain FBO (for chroma/crush/pixel)
+ofFbo postFx[2];          // Ping-pong for chaining effects
+int postFxPing = 0;
+
+bool videoReactiveSwitch=FALSE;
+
+float vLumakeyValue=0.0;
+float vMix=0.0;
+float vHue=0.0;
+float vSaturation=0.0;
+float vBright=0.0;
+float vTemporalFilterMix=0.0;
+float vTemporalFilterResonance=0.0;
+float vSharpenAmount=0.0;
+float vX=0.0;
+float vY=0.0;
+float vZ=0.0;
+float vRotate=0.0;
+float vHuexMod=0.0;
+float vHuexOff=0.0;
+float vHuexLfo=0.0;
+
+//latching
+bool midiActiveFloat[20];
+bool vmidiActiveFloat[20];
+bool midiLowActiveFloat[20];
+bool midiMidActiveFloat[20];
+bool midiHighActiveFloat[20];
+
+float range=200;
+float fftLow;
+float fftMid;
+float fftHigh;
+
+float c_lumakey_value=1.01;
+float c_mix=2;
+float c_hue=.25;
+float c_sat=.2;
+float c_bright=.2;
+float c_temporalFilterMix=1.1;
+float c_sharpenAmount=.5;
+float c_x=.01;
+float c_y=.01;
+float c_z=.05;
+float c_rotate=.314159265;
+float c_huex_off=.25;
+float c_huex_lfo=.25;
+
+int d_delay;
+float d_lumakey_value;
+float d_mix;
+float d_hue;
+float d_sat;
+float d_bright;
+float d_temporalFilterMix;
+float d_temporalFilterResonance;
+float d_sharpenAmount;
+float d_x;
+float d_y;
+float d_z;
+float d_rotate;
+float d_huex_mod;
+float d_huex_off;
+float d_huex_lfo;
+// =============================================================================
+// SETUP — Application initialization
+// =============================================================================
+void ofApp::setup() {
+    // Target 30fps (matches automidi's p-lock timing)
+    ofSetFrameRate(30);
+    ofBackground(0);
+    ofHideCursor();  // No cursor for video output display
+
+    // Initialize subsystems
+    inputSetup();           // Video input (TCP stream from autoclip)
+    midiSetup();            // USB MIDI from automidi Teensy
+    fbDeclareAndAllocate(); // Framebuffer objects for delay/feedback
+
+    // Load GPU shaders
+    shader_mixer.load("shadersES2/shader_mixer");    // Main video processing
+    shaderSharpen.load("shadersES2/shaderSharpen");  // Sharpen post-process
+    shaderMosh.load("shadersES2/shaderMosh");        // Datamosh post-process
+    shaderChroma.load("shadersES2/shaderChroma");    // Chromatic aberration
+    shaderCrush.load("shadersES2/shaderCrush");      // Bit crush
+    shaderPixel.load("shadersES2/shaderPixel");      // Pixelize
+
+    // FFT audio analysis (HiFiBerry line-in)
+    fft.setup();
+    fft.setNormalize(false);
+
+    // Clear p-lock buffers and MIDI state
+    p_lockClear();
+    midiLatchClear();
+
+    // Ensure all post-process effects start at zero
+    moshBase = 0.0f; moshK = 1.0f; moshEnabled = false;
+    chromaBase = 0.0f; chromaAmount = 0.0f;
+    crushBase = 0.0f; crushAmount = 0.0f;
+    pixelBase = 0.0f; pixelAmount = 0.0f;
+
+    // Record startup time for ignoring spurious CCs
+    startupTime = ofGetElapsedTimef();
+    lowC17 = midC17 = highC17 = 0.0f;  // mosh reactivity
+    lowC18 = midC18 = highC18 = 0.0f;  // chroma reactivity
+    lowC19 = midC19 = highC19 = 0.0f;  // crush reactivity
+    lowC20 = midC20 = highC20 = 0.0f;  // pixel reactivity
+}
+//-------------------------------------------------------------
+void ofApp::midiLatchClear(){
+    for(int i=0;i<20;i++){
+        vmidiActiveFloat[i]=0;
+        midiActiveFloat[i]=0;
+        midiLowActiveFloat[i]=0;
+        midiMidActiveFloat[i]=0;
+        midiHighActiveFloat[i]=0;
+    }
+}
+//--------------------------------------------------------------
+void ofApp::update() {
+
+    if(ofGetElapsedTimeMillis() - midiReconnectTimer > 5000) {
+        midiReconnectTimer = ofGetElapsedTimeMillis();
+        if(!midiIn.isOpen() && midiIn.getNumInPorts() > 1) {
+            midiIn.closePort();
+            midiIn.removeListener(this);
+            midiIn.openPort(1);
+            midiIn.ignoreTypes(false, false, false);
+            midiIn.addListener(this);
+        }
+    }
+
+    fft.update();
+    inputUpdate();
+    midibiz();
+    p_lockUpdate();
+    
+    if(fft.getLowVal()>my_normalize){
+        my_normalize=fft.getLowVal();
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::draw() {
+    
+    
+    //the range changes depending on what yr using for sound input.  just usb cams have shitter ranges
+    //so 50 works
+    //float range=200;
+    
+    fftAssignValues();
+    
+    parametersAssign();
+    
+    framebuffer0.begin();
+    shader_mixer.begin();
+    
+    
+    //videoGrabber.getTextureReference().draw(0, 0, 320, 640);
+    if(scaleswitch==0){
+        if(inputswitch==0){
+            //videoGrabber.draw(0,0,320,240);
+        }
+        if(inputswitch==1){
+            cam1.draw(0,0,320,240);
+        }
+    }
+    if(scaleswitch==1){
+        if(inputswitch==0){
+            //videoGrabber.draw(0,0);
+        }
+        if(inputswitch==1){
+            if(hdmi_aspect_ratio_switch==0){
+                cam1.draw(0,0,width,height);
+            }
+            if(hdmi_aspect_ratio_switch==1){
+                aspect_fix_fbo.draw(0,0,width,height);
+            }
+        }
+    }
+    /*
+     //textures
+     shader_mixer.setUniformTexture("fb0", pastFrames[d_delay].getTexture(),1);
+     
+     if(wet_dry_switch==1){
+     shader_mixer.setUniformTexture("fb1", pastFrames[(abs(framedelayoffset-framebufferLength)-1)%framebufferLength].getTexture(),2);
+     }
+     if(wet_dry_switch==0){
+     shader_mixer.setUniformTexture("fb1", dry_framebuffer.getTexture(),2);
+     }
+     //continuous variables
+     shader_mixer.setUniform1f("fb0_lumakey_value",d_lumakey_value);
+     shader_mixer.setUniform1f("fb0_mix",d_mix);
+     shader_mixer.setUniform3f("fb0_hsbx",ofVec3f(d_hue,d_sat,d_bright));
+     shader_mixer.setUniform1f("temporalFilterMix",d_temporalFilterMix);
+     shader_mixer.setUniform1f("fb1_brightx",d_temporalFilterResonance );
+     shader_mixer.setUniform1f("cam1_brightx",d_cam1_x);
+     shader_mixer.setUniform1f("fb0_xdisplace",d_x);
+     shader_mixer.setUniform1f("fb0_ydisplace",d_y);
+     shader_mixer.setUniform1f("fb0_zdisplace",d_z);
+     shader_mixer.setUniform1f("fb0_rotate",d_rotate);
+     shader_mixer.setUniform3f("fb0_huex",ofVec3f(d_huex_mod,d_huex_off,d_huex_lfo));
+     
+     if(wet_dry_switch==1){
+     shader_mixer.setUniform1i("toroidSwitch",toroidSwitch);
+     shader_mixer.setUniform1i("mirrorSwitch",0);
+     }
+     
+     if(wet_dry_switch==0){
+     shader_mixer.setUniform1i("toroidSwitch",0);
+     shader_mixer.setUniform1i("mirrorSwitch",toroidSwitch);
+     }
+     
+     
+     shader_mixer.setUniform1i("brightInvert",brightInvert);
+     shader_mixer.setUniform1i("hueInvert",hueInvert);
+     shader_mixer.setUniform1i("saturationInvert",saturationInvert);
+     
+     shader_mixer.setUniform1i("horizontalMirror",horizontalMirror);
+     shader_mixer.setUniform1i("verticalMirror",verticalMirror);
+     
+     
+     shader_mixer.setUniform1i("lumakeyInvertSwitch",lumakeyInvertSwitch);
+     */
+    //send the textures
+    shader_mixer.setUniformTexture("fb", pastFrames[d_delay].getTexture(),1);
+    if(wet_dry_switch==1){
+        shader_mixer.setUniformTexture("temporalFilter", pastFrames[(abs(framedelayoffset-framebufferLength)-1)%framebufferLength].getTexture(),2);
+    }
+    if(wet_dry_switch==0){
+        shader_mixer.setUniformTexture("temporalFilter", dry_framebuffer.getTexture(),2);
+    }
+    //send the continuous variables
+    shader_mixer.setUniform1f("lumakey",d_lumakey_value);
+    shader_mixer.setUniform1f("fbMix",d_mix);
+    shader_mixer.setUniform1f("fbHue",d_hue);
+    shader_mixer.setUniform1f("fbSaturation",d_sat);
+    shader_mixer.setUniform1f("fbBright",d_bright);
+    shader_mixer.setUniform1f("temporalFilterMix",d_temporalFilterMix);
+    shader_mixer.setUniform1f("temporalFilterResonance",d_temporalFilterResonance );
+    shader_mixer.setUniform1f("fbXDisplace",d_x);
+    shader_mixer.setUniform1f("fbYDisplace",d_y);
+    shader_mixer.setUniform1f("fbZDisplace",d_z);
+    shader_mixer.setUniform1f("fbRotate",d_rotate);
+    shader_mixer.setUniform3f("fb_huex",ofVec3f(d_huex_mod,d_huex_off,d_huex_lfo));
+    shader_mixer.setUniform1f("fbHuexMod",d_huex_mod);
+    shader_mixer.setUniform1f("fbHuexOff",d_huex_off);
+    shader_mixer.setUniform1f("fbHuexLfo",d_huex_lfo);
+    
+    //send the switches
+    shader_mixer.setUniform1i("toroidSwitch",toroidSwitch);
+    shader_mixer.setUniform1i("mirrorSwitch",mirrorSwitch);
+    shader_mixer.setUniform1i("brightInvert",brightInvert);
+    shader_mixer.setUniform1i("hueInvert",hueInvert);
+    shader_mixer.setUniform1i("saturationInvert",saturationInvert);
+    shader_mixer.setUniform1i("horizontalMirror",horizontalMirror);
+    shader_mixer.setUniform1i("verticalMirror",verticalMirror);
+    shader_mixer.setUniform1i("lumakeyInvertSwitch",lumakeyInvertSwitch);
+    
+    //send the videoreactive controls
+    shader_mixer.setUniform1f("vLumakey",vLumakeyValue*c_lumakey_value);
+    shader_mixer.setUniform1f("vMix",vMix*c_mix);
+    shader_mixer.setUniform1f("vHue",2.0f*vHue*c_hue);
+    shader_mixer.setUniform1f("vSat",2.0f*vSaturation*c_sat);
+    shader_mixer.setUniform1f("vBright",2.0f*vBright*c_bright);
+    shader_mixer.setUniform1f("vtemporalFilterMix",vTemporalFilterMix*c_temporalFilterMix);
+    shader_mixer.setUniform1f("vFb1X",vTemporalFilterResonance);
+    shader_mixer.setUniform1f("vX",.01*vX);
+    shader_mixer.setUniform1f("vY",.01*vY);
+    shader_mixer.setUniform1f("vZ",vZ*c_z);
+    shader_mixer.setUniform1f("vRotate",vRotate*c_rotate);
+    shader_mixer.setUniform1f("vHuexMod",1.0f-vHuexMod);
+    shader_mixer.setUniform1f("vHuexOff",vHuexOff*c_huex_off);
+    shader_mixer.setUniform1f("vHuexLfo",vHuexLfo*c_huex_lfo);
+    shader_mixer.end();
+    framebuffer0.end();
+    
+    /**sharpening mode — bypass when amount is zero**/
+    bool doSharpen = (d_sharpenAmount > 0.01f) || (vSharpenAmount * c_sharpenAmount > 0.01f);
+    ofFbo& outputFbo = doSharpen ? sharpenFramebuffer : framebuffer0;
+
+    if(doSharpen) {
+        sharpenFramebuffer.begin();
+        shaderSharpen.begin();
+        framebuffer0.draw(0,0);
+        shaderSharpen.setUniform1f("sharpenAmount",d_sharpenAmount);
+        shaderSharpen.setUniform1f("vSharpenAmount",vSharpenAmount*c_sharpenAmount);
+        shaderSharpen.end();
+        sharpenFramebuffer.end();
+    }
+
+    /**datamosh mode — bypass when k is 1.0**/
+    ofFbo* finalOutput = &outputFbo;
+    static bool moshWasActive = false;
+
+    // Calculate mosh amount with audio reactivity
+    // True bypass: if base is 0, effect is off regardless of reactivity
+    float moshLowScale  = 1.0f + low_value_smoothed * 2.0f;
+    float moshMidScale  = 1.0f + mid_value_smoothed * 2.0f;
+    float moshHighScale = 1.0f + high_value_smoothed * 2.0f;
+    float moshAudio = lowC17*low_value_smoothed*moshLowScale + midC17*mid_value_smoothed*moshMidScale + highC17*high_value_smoothed*moshHighScale;
+    float moshTotal = (moshBase > 0.001f) ? min(1.0f, moshBase + moshAudio) : 0.0f;
+
+    // Update moshK and moshEnabled based on combined value
+    if(moshTotal < 0.01f){
+        moshEnabled = false;
+        moshK = 1.0f;
+    } else {
+        moshEnabled = true;
+        moshK = exp((1.0f - moshTotal) * log(1.0f) + moshTotal * log(0.02f));
+    }
+
+    bool moshActive = moshEnabled && moshK < 0.99f;
+
+    // Prime accumulators and prevFrame when mosh first activates
+    if(moshActive && !moshWasActive) {
+        for(int i = 0; i < 2; i++) {
+            moshAccum[i].begin();
+            outputFbo.draw(0,0);
+            moshAccum[i].end();
+        }
+        moshPrevFrame.begin();
+        outputFbo.draw(0,0);
+        moshPrevFrame.end();
+    }
+    moshWasActive = moshActive;
+
+    if(moshActive) {
+        int nextPing = 1 - moshPing;
+        moshAccum[nextPing].begin();
+        shaderMosh.begin();
+        shaderMosh.setUniformTexture("tex0", outputFbo.getTexture(), 0);
+        shaderMosh.setUniformTexture("texAccum", moshAccum[moshPing].getTexture(), 1);
+        shaderMosh.setUniformTexture("texPrev", moshPrevFrame.getTexture(), 2);
+        shaderMosh.setUniform1f("kEff", moshK);
+        shaderMosh.setUniform1f("mvScale", moshMvScale);
+        shaderMosh.setUniform1f("satRestore", moshSatRestore);
+        outputFbo.draw(0,0);
+        shaderMosh.end();
+        moshAccum[nextPing].end();
+        moshPing = nextPing;
+        finalOutput = &moshAccum[moshPing];
+    }
+    // Store current frame for next iteration's motion estimation
+    moshPrevFrame.begin();
+    outputFbo.draw(0,0);
+    moshPrevFrame.end();
+
+    // Calculate chroma and crush amounts with audio reactivity
+    // True bypass: if base is 0, effect is off regardless of reactivity
+    float chromaLowScale  = 1.0f + low_value_smoothed * 2.0f;
+    float chromaMidScale  = 1.0f + mid_value_smoothed * 2.0f;
+    float chromaHighScale = 1.0f + high_value_smoothed * 2.0f;
+    float chromaAudio = lowC18*low_value_smoothed*chromaLowScale + midC18*mid_value_smoothed*chromaMidScale + highC18*high_value_smoothed*chromaHighScale;
+    chromaAmount = (chromaBase > 0.001f) ? min(1.0f, chromaBase + chromaAudio) : 0.0f;
+
+    float crushLowScale  = 1.0f + low_value_smoothed * 2.0f;
+    float crushMidScale  = 1.0f + mid_value_smoothed * 2.0f;
+    float crushHighScale = 1.0f + high_value_smoothed * 2.0f;
+    float crushAudio = lowC19*low_value_smoothed*crushLowScale + midC19*mid_value_smoothed*crushMidScale + highC19*high_value_smoothed*crushHighScale;
+    crushAmount = (crushBase > 0.001f) ? min(1.0f, crushBase + crushAudio) : 0.0f;
+
+    float pixelLowScale  = 1.0f + low_value_smoothed * 2.0f;
+    float pixelMidScale  = 1.0f + mid_value_smoothed * 2.0f;
+    float pixelHighScale = 1.0f + high_value_smoothed * 2.0f;
+    float pixelAudio = lowC20*low_value_smoothed*pixelLowScale + midC20*mid_value_smoothed*pixelMidScale + highC20*high_value_smoothed*pixelHighScale;
+    pixelAmount = (pixelBase > 0.001f) ? min(1.0f, pixelBase + pixelAudio) : 0.0f;
+
+    // Apply chroma, crush, and pixel post-processing chain
+    bool doChroma = chromaAmount > 0.001f;
+    bool doCrush = crushAmount > 0.001f;
+    bool doPixel = pixelAmount > 0.001f;
+
+    if(doChroma || doCrush || doPixel) {
+        // Copy finalOutput to postFx[0] as starting point
+        postFx[0].begin();
+        finalOutput->draw(0,0);
+        postFx[0].end();
+        postFxPing = 0;
+
+        // Apply chromatic aberration
+        if(doChroma) {
+            int nextPing = 1 - postFxPing;
+            postFx[nextPing].begin();
+            shaderChroma.begin();
+            shaderChroma.setUniformTexture("tex0", postFx[postFxPing].getTexture(), 0);
+            shaderChroma.setUniform1f("amount", chromaAmount);
+            postFx[postFxPing].draw(0,0);
+            shaderChroma.end();
+            postFx[nextPing].end();
+            postFxPing = nextPing;
+        }
+
+        // Apply bit crush
+        if(doCrush) {
+            int nextPing = 1 - postFxPing;
+            postFx[nextPing].begin();
+            shaderCrush.begin();
+            shaderCrush.setUniformTexture("tex0", postFx[postFxPing].getTexture(), 0);
+            shaderCrush.setUniform1f("amount", crushAmount);
+            postFx[postFxPing].draw(0,0);
+            shaderCrush.end();
+            postFx[nextPing].end();
+            postFxPing = nextPing;
+        }
+
+        // Apply pixelize
+        if(doPixel) {
+            int nextPing = 1 - postFxPing;
+            postFx[nextPing].begin();
+            shaderPixel.begin();
+            shaderPixel.setUniformTexture("tex0", postFx[postFxPing].getTexture(), 0);
+            shaderPixel.setUniform1f("amount", pixelAmount);
+            shaderPixel.setUniform2f("resolution", (float)width, (float)height);
+            postFx[postFxPing].draw(0,0);
+            shaderPixel.end();
+            postFx[nextPing].end();
+            postFxPing = nextPing;
+        }
+
+        finalOutput = &postFx[postFxPing];
+    }
+
+    finalOutput->draw(0,0,ofGetWidth(),ofGetHeight());
+
+    blackoutSmoothed += (blackoutAmount - blackoutSmoothed) * 0.08f;
+    if(blackoutSmoothed > 0.004f){
+        ofEnableAlphaBlending();
+        ofSetColor(0, 0, 0, (int)(blackoutSmoothed * 255));
+        ofDrawRectangle(0, 0, ofGetWidth(), ofGetHeight());
+        ofSetColor(255, 255, 255, 255);
+    }
+
+    pastFrames[abs(framebufferLength-framedelayoffset)-1].begin(); //eeettt
+    if(wet_dry_switch==0){
+        if(inputswitch==0){
+            //videoGrabber.draw(0,0,framebuffer0.getWidth(),framebuffer0.getHeight());
+        }
+        if(inputswitch==1){
+            if(hdmi_aspect_ratio_switch==0){
+                cam1.draw(0,0,width,height);
+            }
+            if(hdmi_aspect_ratio_switch==1){
+                aspect_fix_fbo.draw(0,0,width,height);
+            }
+        }
+
+        dry_framebuffer.begin();
+        //framebuffer0.draw(0,0);
+        outputFbo.draw(0,0);
+        dry_framebuffer.end();
+
+    }//endifwetdry0
+
+    if(wet_dry_switch==1){
+        //framebuffer0.draw(0,0);
+        outputFbo.draw(0,0);
+    }//endifwetdry1
+    
+    pastFrames[abs(framebufferLength-framedelayoffset)-1].end(); //eeettt
+    incIndex();
+    
+    //p_lock biz
+    if(p_lock_switch==1){
+        p_lock_increment++;
+        p_lock_increment=p_lock_increment%p_lock_size;
+    }
+    
+    //ofDrawBitmapString("fps =" + ofToString(ofGetFrameRate())+"fft low =" + ofToString(fftLow)+"fft low_smoothed =" + ofToString(low_value_smoothed)+"fft mid =" + ofToString(fftLow)+"fft mid_smoothed =" + ofToString(mid_value_smoothed), 10, ofGetHeight() - 5 );
+    /*ofDrawBitmapString("fft high =" + ofToString(fftHigh,2)+
+     "fft high_smoothed =" + ofToString(high_value_smoothed,2)+
+     "fft mid =" + ofToString(fftMid,2)+
+     "fft mid_smoothed =" + ofToString(mid_value_smoothed,2)+
+     "fft low =" + ofToString(fftLow,2)+
+     "fft low_smoothed =" + ofToString(low_value_smoothed,2)
+     , 10, ofGetHeight() - 5 );
+     */
+    
+    /*
+     ofDrawBitmapString(
+     "fft high =" + ofToString(high_value_smoothed,2)+
+     "fft mid =" + ofToString(mid_value_smoothed,2)+
+     "fft low =" + ofToString(low_value_smoothed,2)
+     , 10, ofGetHeight() - 5 );
+     */
+    
+    
+    //i use this block of code to print out like useful information for debugging various things and/or just to keep the
+    //framerate displayed to make sure i'm not losing any frames while testing out new features.  uncomment the ofDrawBitmap etc etc
+    //to print the stuff out on screen
+    ofSetColor(255);
+    string msg="fps="+ofToString(ofGetFrameRate(),2)+" clear switch"+ofToString(clear_switch,5);//+" z="+ofToString(az,5);
+    //ofDrawBitmapString(msg,10,10);
+}
+
+//--------------------------------------------------------------
+void ofApp::exit() {
+    
+    // clean up
+    midiIn.closePort();
+    midiIn.removeListener(this);
+}
+//--------------------------------------------------------------
+/*
+ 
+ void ofApp::omx_settings(){
+ 
+ settings.sensorWidth = 640;
+ settings.sensorHeight = 480;
+ settings.framerate = 30;
+ settings.enableTexture = true;
+ settings.sensorMode=7;
+ 
+ settings.whiteBalance ="Off";
+ settings.exposurePreset ="Off";
+ settings.whiteBalanceGainR = 1.0;
+ settings.whiteBalanceGainB = 1.0;
+ 
+ }
+ //------------------------------------------------------------
+ 
+ void ofApp::omx_updates(){
+ 
+ videoGrabber.setSharpness(50);
+ videoGrabber.setBrightness(40);
+ videoGrabber.setContrast(100);
+ videoGrabber.setSaturation(0);
+ 
+ }
+ */
+//--------------------------------------------------------------
+void ofApp::fillPLockFromCurrent() {
+    for(int i=0;i<p_lock_number;i++){
+        for(int j=0;j<p_lock_size;j++){
+            p_lock[i][j]=p_lock[i][p_lock_increment];
+        }
+    }
+}
+
+void ofApp::saveAudioPatch(int slot) {
+    string path = "/home/pi/audiopatches/AUDIO" + ofToString(slot, 0, 2, '0') + ".TXT" ;
+    ofFile file(path, ofFile::WriteOnly) ;
+    if (!file.is_open()) return ;
+    for (int i = 1 ; i <= 20 ; i++) {
+        float lv, mv, hv ;
+        switch(i) {
+            case 1:  lv=lowC1;  mv=midC1;  hv=highC1;  break ;
+            case 2:  lv=lowC2;  mv=midC2;  hv=highC2;  break ;
+            case 3:  lv=lowC3;  mv=midC3;  hv=highC3;  break ;
+            case 4:  lv=lowC4;  mv=midC4;  hv=highC4;  break ;
+            case 5:  lv=lowC5;  mv=midC5;  hv=highC5;  break ;
+            case 6:  lv=lowC6;  mv=midC6;  hv=highC6;  break ;
+            case 7:  lv=lowC7;  mv=midC7;  hv=highC7;  break ;
+            case 8:  lv=lowC8;  mv=midC8;  hv=highC8;  break ;
+            case 9:  lv=lowC9;  mv=midC9;  hv=highC9;  break ;
+            case 10: lv=lowC10; mv=midC10; hv=highC10; break ;
+            case 11: lv=lowC11; mv=midC11; hv=highC11; break ;
+            case 12: lv=lowC12; mv=midC12; hv=highC12; break ;
+            case 13: lv=lowC13; mv=midC13; hv=highC13; break ;
+            case 14: lv=lowC14; mv=midC14; hv=highC14; break ;
+            case 15: lv=lowC15; mv=midC15; hv=highC15; break ;
+            case 16: lv=lowC16; mv=midC16; hv=highC16; break ;
+            case 17: lv=lowC17; mv=midC17; hv=highC17; break ;  // Mosh
+            case 18: lv=lowC18; mv=midC18; hv=highC18; break ;  // Chroma
+            case 19: lv=lowC19; mv=midC19; hv=highC19; break ;  // Crush
+            case 20: lv=lowC20; mv=midC20; hv=highC20; break ;  // Pixel
+            default: lv=mv=hv=0; break ;
+        }
+        file << "low" << i << "=" << lv << "\n" ;
+        file << "mid" << i << "=" << mv << "\n" ;
+        file << "high" << i << "=" << hv << "\n" ;
+    }
+    file << "react=" << audioReactiveControlSwitch << "\n" ;
+    // Save envelope params (read current values from /tmp files)
+    FILE* pf ; int val ;
+    pf = fopen("/dev/shm/fft_smooth", "r") ;
+    if (pf) { if (fscanf(pf, "%d", &val) == 1) file << "fftSmooth=" << val << "\n" ; fclose(pf) ; }
+    pf = fopen("/dev/shm/fft_attack", "r") ;
+    if (pf) { if (fscanf(pf, "%d", &val) == 1) file << "fftAttack=" << val << "\n" ; fclose(pf) ; }
+    pf = fopen("/dev/shm/fft_decay", "r") ;
+    if (pf) { if (fscanf(pf, "%d", &val) == 1) file << "fftDecay=" << val << "\n" ; fclose(pf) ; }
+    pf = fopen("/dev/shm/fft_bdecay", "r") ;
+    if (pf) { if (fscanf(pf, "%d", &val) == 1) file << "fftBDecay=" << val << "\n" ; fclose(pf) ; }
+    pf = fopen("/dev/shm/fft_hit", "r") ;
+    if (pf) { if (fscanf(pf, "%d", &val) == 1) file << "fftHit=" << val << "\n" ; fclose(pf) ; }
+    pf = fopen("/dev/shm/fft_slide", "r") ;
+    if (pf) { if (fscanf(pf, "%d", &val) == 1) file << "fftSlide=" << val << "\n" ; fclose(pf) ; }
+    file.close() ;
+}
+
+void ofApp::loadAudioPatch(int slot) {
+    string path = "/home/pi/audiopatches/AUDIO" + ofToString(slot, 0, 2, '0') + ".TXT" ;
+    ofFile file(path, ofFile::ReadOnly) ;
+    if (!file.is_open()) return ;
+    bool hasEnvValues = false ;  // Track if patch contains envelope values
+    while (!file.eof()) {
+        string line ;
+        getline(file, line) ;
+        if (line.empty()) continue ;
+        int eq = line.find('=') ;
+        if (eq == string::npos) continue ;
+        string key = line.substr(0, eq) ;
+        float val = ofToFloat(line.substr(eq + 1)) ;
+        if      (key=="low1")  lowC1=val ;
+        else if (key=="low2")  lowC2=val ;
+        else if (key=="low3")  lowC3=val ;
+        else if (key=="low4")  lowC4=val ;
+        else if (key=="low5")  lowC5=val ;
+        else if (key=="low6")  lowC6=val ;
+        else if (key=="low7")  lowC7=val ;
+        else if (key=="low8")  lowC8=val ;
+        else if (key=="low9")  lowC9=val ;
+        else if (key=="low10") lowC10=val ;
+        else if (key=="low11") lowC11=val ;
+        else if (key=="low12") lowC12=val ;
+        else if (key=="low13") lowC13=val ;
+        else if (key=="low14") lowC14=val ;
+        else if (key=="low15") lowC15=val ;
+        else if (key=="low16") lowC16=val ;
+        else if (key=="low17") lowC17=val ;  // Mosh
+        else if (key=="low18") lowC18=val ;  // Chroma
+        else if (key=="low19") lowC19=val ;  // Crush
+        else if (key=="low20") lowC20=val ;  // Pixel
+        else if (key=="mid1")  midC1=val ;
+        else if (key=="mid2")  midC2=val ;
+        else if (key=="mid3")  midC3=val ;
+        else if (key=="mid4")  midC4=val ;
+        else if (key=="mid5")  midC5=val ;
+        else if (key=="mid6")  midC6=val ;
+        else if (key=="mid7")  midC7=val ;
+        else if (key=="mid8")  midC8=val ;
+        else if (key=="mid9")  midC9=val ;
+        else if (key=="mid10") midC10=val ;
+        else if (key=="mid11") midC11=val ;
+        else if (key=="mid12") midC12=val ;
+        else if (key=="mid13") midC13=val ;
+        else if (key=="mid14") midC14=val ;
+        else if (key=="mid15") midC15=val ;
+        else if (key=="mid16") midC16=val ;
+        else if (key=="mid17") midC17=val ;  // Mosh
+        else if (key=="mid18") midC18=val ;  // Chroma
+        else if (key=="mid19") midC19=val ;  // Crush
+        else if (key=="mid20") midC20=val ;  // Pixel
+        else if (key=="high1")  highC1=val ;
+        else if (key=="high2")  highC2=val ;
+        else if (key=="high3")  highC3=val ;
+        else if (key=="high4")  highC4=val ;
+        else if (key=="high5")  highC5=val ;
+        else if (key=="high6")  highC6=val ;
+        else if (key=="high7")  highC7=val ;
+        else if (key=="high8")  highC8=val ;
+        else if (key=="high9")  highC9=val ;
+        else if (key=="high10") highC10=val ;
+        else if (key=="high11") highC11=val ;
+        else if (key=="high12") highC12=val ;
+        else if (key=="high13") highC13=val ;
+        else if (key=="high14") highC14=val ;
+        else if (key=="high15") highC15=val ;
+        else if (key=="high16") highC16=val ;
+        else if (key=="high17") highC17=val ;  // Mosh
+        else if (key=="high18") highC18=val ;  // Chroma
+        else if (key=="high19") highC19=val ;  // Crush
+        else if (key=="high20") highC20=val ;  // Pixel
+        else if (key=="react")  audioReactiveControlSwitch=(int)val ;
+        // Load envelope params - integer format (0-127)
+        else if (key=="fftSmooth") { extSmooth = val/127.0f ; hasEnvValues = true ; }
+        else if (key=="fftAttack") { extAttack = val/127.0f ; hasEnvValues = true ; }
+        else if (key=="fftDecay")  { extDecay = val/127.0f ; hasEnvValues = true ; }
+        else if (key=="fftBDecay") { extBDecay = val/127.0f ; hasEnvValues = true ; }
+        else if (key=="fftHit")    { extHit = val/127.0f ; hasEnvValues = true ; }
+        else if (key=="fftSlide")  { extSlide = val/127.0f ; hasEnvValues = true ; }
+        // Load envelope params - float format (0.0-1.0, legacy)
+        else if (key=="extSmooth") { extSmooth = val ; hasEnvValues = true ; }
+        else if (key=="extAttack") { extAttack = val ; hasEnvValues = true ; }
+        else if (key=="extDecay")  { extDecay = val ; hasEnvValues = true ; }
+        else if (key=="extBDecay") { extBDecay = val ; hasEnvValues = true ; }
+        else if (key=="extHit")    { extHit = val ; hasEnvValues = true ; }
+        else if (key=="extSlide")  { extSlide = val ; hasEnvValues = true ; }
+    }
+    file.close() ;
+    // Only update envelope values if patch contains them
+    if (hasEnvValues) {
+        FILE* tf ;
+        int s = (int)(extSmooth * 127) ;
+        int a = (int)(extAttack * 127) ;
+        int d = (int)(extDecay * 127) ;
+        int b = (int)(extBDecay * 127) ;
+        int h = (int)(extHit * 127) ;
+        int sl = (int)(extSlide * 127) ;
+        if ((tf = fopen("/dev/shm/fft_smooth", "w"))) { fprintf(tf, "%d", s); fclose(tf); chmod("/dev/shm/fft_smooth", 0666); }
+        if ((tf = fopen("/dev/shm/fft_attack", "w"))) { fprintf(tf, "%d", a); fclose(tf); chmod("/dev/shm/fft_attack", 0666); }
+        if ((tf = fopen("/dev/shm/fft_decay", "w"))) { fprintf(tf, "%d", d); fclose(tf); chmod("/dev/shm/fft_decay", 0666); }
+        if ((tf = fopen("/dev/shm/fft_bdecay", "w"))) { fprintf(tf, "%d", b); fclose(tf); chmod("/dev/shm/fft_bdecay", 0666); }
+        if ((tf = fopen("/dev/shm/fft_hit", "w"))) { fprintf(tf, "%d", h); fclose(tf); chmod("/dev/shm/fft_hit", 0666); }
+        if ((tf = fopen("/dev/shm/fft_slide", "w"))) { fprintf(tf, "%d", sl); fclose(tf); chmod("/dev/shm/fft_slide", 0666); }
+        if ((tf = fopen("/dev/shm/fft_env_update", "w"))) { fprintf(tf, "%d,%d,%d,%d,%d,%d", s, a, d, b, h, sl); fclose(tf); chmod("/dev/shm/fft_env_update", 0666); }
+        // Don't set fftParamsDirty - we already have the correct values in extSmooth etc.
+        // Setting it would cause fftAssignValues to re-read from files, which might have
+        // been overwritten by Teensy encoder updates, causing jitter
+    }
+}
+
+void ofApp::fftAssignValues(){
+    // If inputGain is zero, kill all audio reactivity
+    if(inputGain < 0.01f){
+        fftLow = 0.0f;
+        fftMid = 0.0f;
+        fftHigh = 0.0f;
+        low_value_smoothed = 0.0f;
+        mid_value_smoothed = 0.0f;
+        high_value_smoothed = 0.0f;
+        return;
+    }
+
+    // External FFT mode: read from Teensy via file
+    if (useExternalFFT) {
+        static int paramReadCounter = 0 ;
+
+        // Read envelope params from /tmp files periodically or when dirty
+        if (fftParamsDirty || ++paramReadCounter >= 30) {
+            paramReadCounter = 0 ;
+            fftParamsDirty = false ;
+            FILE* pf ; int val ;
+            pf = fopen("/dev/shm/fft_smooth", "r") ;
+            if (pf) { if (fscanf(pf, "%d", &val) == 1) extSmooth = val / 127.0f ; fclose(pf) ; }
+            pf = fopen("/dev/shm/fft_attack", "r") ;
+            if (pf) { if (fscanf(pf, "%d", &val) == 1) extAttack = val / 127.0f ; fclose(pf) ; }
+            pf = fopen("/dev/shm/fft_decay", "r") ;
+            if (pf) { if (fscanf(pf, "%d", &val) == 1) extDecay = val / 127.0f ; fclose(pf) ; }
+            pf = fopen("/dev/shm/fft_bdecay", "r") ;
+            if (pf) { if (fscanf(pf, "%d", &val) == 1) extBDecay = val / 127.0f ; fclose(pf) ; }
+            pf = fopen("/dev/shm/fft_hit", "r") ;
+            if (pf) { if (fscanf(pf, "%d", &val) == 1) extHit = val / 127.0f ; fclose(pf) ; }
+            pf = fopen("/dev/shm/fft_slide", "r") ;
+            if (pf) { if (fscanf(pf, "%d", &val) == 1) extSlide = val / 127.0f ; fclose(pf) ; }
+        }
+
+        // Read FFT every frame for responsive audio reactivity
+        {
+            FILE* f = fopen("/dev/shm/fft_values", "r") ;
+            if (f) {
+                int low = -1, mid = -1, high = -1 ;
+                if (fscanf(f, "%d %d %d", &low, &mid, &high) == 3 && low >= 0) {
+                    float fftScale = 0.5f ;
+
+                    // Convert to 0-1 range and apply scale
+                    float newLow = (low / 127.0f) * fftScale ;
+                    float newMid = (mid / 127.0f) * fftScale ;
+                    float newHigh = (high / 127.0f) * fftScale ;
+
+                    // At 0%, features are bypassed (instant/raw behavior)
+                    // Smooth=0: raw passthrough, Attack=0: instant rise, Decay=0: instant fall
+                    if (extSmooth < 0.01f) {
+                        // No smoothing at all - use raw values
+                        low_value_smoothed = newLow ;
+                        mid_value_smoothed = newMid ;
+                        high_value_smoothed = newHigh ;
+                    } else {
+                        // Check rising/falling for each band
+                        bool lowRising = newLow > low_value_smoothed ;
+                        bool midRising = newMid > mid_value_smoothed ;
+                        bool highRising = newHigh > high_value_smoothed ;
+
+                        // Transient detection: jump on big rises, slide the rest
+                        // extHit controls jump amount (0=no jump, 1=full jump)
+                        // extSlide controls slide-in rate after transient (0=instant, 1=slow)
+                        float transientThresh = 0.08f ;  // Jump threshold for transient response
+                        float transientJump = extHit ;   // How far to jump (from control)
+                        float slideRate = 1.0f - extSlide * 0.8f ;  // Convert to rate: 0->1.0, 1->0.2
+                        bool lowTransient = lowRising && (newLow - low_value_smoothed > transientThresh) ;
+                        bool midTransient = midRising && (newMid - mid_value_smoothed > transientThresh) ;
+                        bool highTransient = highRising && (newHigh - high_value_smoothed > transientThresh) ;
+
+                        // Attack=0 means instant rise, Decay=0 means instant fall
+                        if (lowRising && extAttack < 0.01f) {
+                            low_value_smoothed = newLow ;
+                        } else if (lowTransient) {
+                            // Jump by hit amount, slide the rest at slideRate
+                            low_value_smoothed += (newLow - low_value_smoothed) * transientJump ;
+                            // Apply fast slide for remainder
+                            low_value_smoothed += (newLow - low_value_smoothed) * slideRate ;
+                        } else if (!lowRising && extDecay < 0.01f) {
+                            low_value_smoothed = newLow ;
+                        } else {
+                            float rateLow = lowRising ? extAttack : extDecay ;
+                            low_value_smoothed += (newLow - low_value_smoothed) * rateLow * extSmooth ;
+                        }
+
+                        if (midRising && extAttack < 0.01f) {
+                            mid_value_smoothed = newMid ;
+                        } else if (midTransient) {
+                            mid_value_smoothed += (newMid - mid_value_smoothed) * transientJump ;
+                            mid_value_smoothed += (newMid - mid_value_smoothed) * slideRate ;
+                        } else if (!midRising && extDecay < 0.01f) {
+                            mid_value_smoothed = newMid ;
+                        } else {
+                            float rateMid = midRising ? extAttack : extDecay ;
+                            mid_value_smoothed += (newMid - mid_value_smoothed) * rateMid * extSmooth ;
+                        }
+
+                        if (highRising && extAttack < 0.01f) {
+                            high_value_smoothed = newHigh ;
+                        } else if (highTransient) {
+                            high_value_smoothed += (newHigh - high_value_smoothed) * transientJump ;
+                            high_value_smoothed += (newHigh - high_value_smoothed) * slideRate ;
+                        } else if (!highRising && extDecay < 0.01f) {
+                            high_value_smoothed = newHigh ;
+                        } else {
+                            float rateHigh = highRising ? extAttack : extDecay ;
+                            high_value_smoothed += (newHigh - high_value_smoothed) * rateHigh * extSmooth ;
+                        }
+                    }
+
+                    // Apply band decay only if > 0 (at 0%, band decay is disabled)
+                    if (extBDecay > 0.01f) {
+                        float bdMult = 1.0f - (1.0f - extBDecay) * 0.02f ;
+                        low_value_smoothed *= bdMult ;
+                        mid_value_smoothed *= bdMult ;
+                        high_value_smoothed *= bdMult ;
+                    }
+                }
+                fclose(f) ;
+            }
+        }
+        return ;
+    }
+
+    // Local HiFiBerry FFT mode
+    fftLow=fft.getLowVal() * inputGain;
+    fftLow=ofClamp(fftLow,0.0f,range);
+    fftLow=fftLow/range;
+    low_value_smoothed=fftLow*smoothing_rate+(1.0f-smoothing_rate)*low_value_smoothed;
+
+    fftMid=fft.getMidVal() * inputGain;
+    fftMid=ofClamp(fftMid,0.0f,range);
+    fftMid=fftMid/range;
+    mid_value_smoothed=fftMid*smoothing_rate+(1.0f-smoothing_rate)*mid_value_smoothed;
+
+    fftHigh=fft.getHighVal() * inputGain;
+    fftHigh=ofClamp(fftHigh,0.0f,range);
+    fftHigh=fftHigh/range;
+    high_value_smoothed=fftHigh*smoothing_rate+(1.0f-smoothing_rate)*high_value_smoothed;
+}
+//-------------------------------------------------------------
+void ofApp::parametersAssign(){
+    if(wet_dry_switch==0){
+        c_hue=1.0;
+        c_sat=1.0;
+        c_bright=1.0;
+        c_x=.1;
+        c_y=.1;
+        c_z=.5;
+    }
+    
+    // Audio reactivity with loudness scaling: fft * (1 + fft*2) gives 3x effect at max volume
+    float lowScale  = 1.0f + low_value_smoothed * 2.0f;
+    float midScale  = 1.0f + mid_value_smoothed * 2.0f;
+    float highScale = 1.0f + high_value_smoothed * 2.0f;
+
+    d_delay=(abs(framedelayoffset-framebufferLength-fb0_delayamount-
+                 int((p_lock_smoothed[15]+lowC16*low_value_smoothed*lowScale+midC16*mid_value_smoothed*midScale+highC16*high_value_smoothed*highScale)*(framebufferLength-1.0))
+                 )-1)%framebufferLength;
+
+    d_lumakey_value=kk+c_lumakey_value*p_lock_smoothed[0]+2.8f*(
+                                                                lowC1*low_value_smoothed*lowScale+
+                                                                midC1*mid_value_smoothed*midScale+
+                                                                highC1*high_value_smoothed*highScale);
+    d_mix=jm+c_mix*p_lock_smoothed[1]+2.8f*(
+                                            lowC2*low_value_smoothed*lowScale+
+                                            midC2*mid_value_smoothed*midScale+
+                                            highC2*high_value_smoothed*highScale);
+    d_hue=fv*(1.0f+c_hue*p_lock_smoothed[2])+2.8f*(
+                                                   lowC3*low_value_smoothed*lowScale+
+                                                   midC3*mid_value_smoothed*midScale+
+                                                   highC3*high_value_smoothed*highScale);
+    d_sat=gb*(1.0f+c_sat*p_lock_smoothed[3])+2.8f*(
+                                                   lowC4*low_value_smoothed*lowScale+
+                                                   midC4*mid_value_smoothed*midScale+
+                                                   highC4*high_value_smoothed*highScale);
+    d_bright=hn*(1.0f+c_bright*p_lock_smoothed[4])+2.8f*(
+                                                         lowC5*low_value_smoothed*lowScale+
+                                                         midC5*mid_value_smoothed*midScale+
+                                                         highC5*high_value_smoothed*highScale);
+    d_temporalFilterMix=op+c_temporalFilterMix*p_lock_smoothed[5]+2.8f*(
+                                                                        lowC6*low_value_smoothed*lowScale+
+                                                                        midC6*mid_value_smoothed*midScale+
+                                                                        highC6*high_value_smoothed*highScale);
+    d_temporalFilterResonance=fb1_brightx+p_lock_smoothed[6]+4.0*(
+                                                                  lowC7*low_value_smoothed*lowScale+
+                                                                  midC7*mid_value_smoothed*midScale+
+                                                                  highC7*high_value_smoothed*highScale);
+    d_sharpenAmount=ll+c_sharpenAmount*p_lock_smoothed[7]+8.0f*(
+                                                                lowC8*low_value_smoothed*lowScale+
+                                                                midC8*mid_value_smoothed*midScale+
+                                                                highC8*high_value_smoothed*highScale);
+    d_x=sx+c_x*p_lock_smoothed[8]+2.8f*(
+                                        c_x*(lowC9*low_value_smoothed*lowScale+
+                                             midC9*mid_value_smoothed*midScale+
+                                             highC9*high_value_smoothed*highScale));
+    d_y=dc+c_y*p_lock_smoothed[9]+2.8f*(
+                                        c_y*(lowC10*low_value_smoothed*lowScale+
+                                             midC10*mid_value_smoothed*midScale+
+                                             highC10*high_value_smoothed*highScale));
+    d_z=az*(1.0f+c_z*p_lock_smoothed[10])+2.8f*(
+                                                c_z*(lowC11*low_value_smoothed*lowScale+
+                                                     midC11*mid_value_smoothed*midScale+
+                                                     highC11*high_value_smoothed*highScale));
+    d_rotate=qw+c_rotate*p_lock_smoothed[11]+4.0*(
+                                                  c_rotate*(lowC12*low_value_smoothed*lowScale+
+                                                            midC12*mid_value_smoothed*midScale+
+                                                            highC12*high_value_smoothed*highScale));
+    d_huex_mod=er*(1.0f-p_lock_smoothed[12])+2.8f*(
+                                                   lowC13*low_value_smoothed*lowScale+
+                                                   midC13*mid_value_smoothed*midScale+
+                                                   highC13*high_value_smoothed*highScale);
+    d_huex_off=ty+c_huex_off*p_lock_smoothed[13]+2.8f*(
+                                                       c_huex_off*(lowC14*low_value_smoothed*lowScale+
+                                                                   midC14*mid_value_smoothed*midScale+
+                                                                   highC14*high_value_smoothed*highScale));
+    d_huex_lfo=ui+c_huex_lfo*p_lock_smoothed[14]+2.8f*(
+                                                       c_huex_lfo*(lowC15*low_value_smoothed*lowScale+
+                                                                   midC15*mid_value_smoothed*midScale+
+                                                                   highC15*high_value_smoothed*highScale));
+}	
+//--------------------------------------------------------------
+void ofApp::newMidiMessage(ofxMidiMessage& msg) {
+    // add the latest message to the message queue
+    midiMessages.push_back(msg);
+    // remove any old messages if we have too many
+    while(midiMessages.size() > 64) {
+        midiMessages.erase(midiMessages.begin());
+    }
+}
+//------------------------------------------------------------
+void ofApp::p_lockUpdate(){
+    for(int i=0;i<p_lock_number;i++){
+        p_lock_smoothed[i]=p_lock[i][p_lock_increment]*(1.0f-p_lock_smooth)+p_lock_smoothed[i]*p_lock_smooth;
+        if(abs(p_lock_smoothed[i])<.05){p_lock_smoothed[i]=0;}
+    }
+}
+//-------------------------------------------------------------
+void ofApp::inputUpdate(){
+    if(inputswitch==1){
+        cam1.update();
+        //corner crop and stretch to preserve hd aspect ratio
+        if(hdmi_aspect_ratio_switch==1){
+            aspect_fix_fbo.begin();
+            cam1.draw(0,0,853,480);
+            aspect_fix_fbo.end();
+        }
+    }
+    if(inputswitch==0){
+        //omx_updates();
+    }
+}
+//------------------------------------------------------------
+void ofApp::p_lockClear(){
+    for(int i=0;i<p_lock_number;i++){
+        for(int j=0;j<p_lock_size;j++){
+            p_lock[i][j]=0;
+        }
+    }
+}
+//------------------------------------------------------------
+void ofApp::midiSetup(){
+    // print input ports to console
+    midiIn.listInPorts();
+    
+    // open port by number (you may need to change this)
+    midiIn.openPort(1);
+    //midiIn.openPort("IAC Pure Data In");	// by name
+    //midiIn.openVirtualPort("ofxMidiIn Input"); // open a virtual port
+    
+    // don't ignore sysex, timing, & active sense messages,
+    // these are ignored by default
+    midiIn.ignoreTypes(false, false, false);
+    
+    // add ofApp as a listener
+    midiIn.addListener(this);
+    
+    // print received messages to the console
+    midiIn.setVerbose(true);
+}
+//-------------------------------------------------------------
+void ofApp::fbDeclareAndAllocate(){
+    framebuffer0.allocate(width,height);
+    framebuffer0.begin();
+    ofClear(0,0,0,255);
+    framebuffer0.end();
+    
+    aspect_fix_fbo.allocate(width,height);
+    aspect_fix_fbo.begin();
+    ofClear(0,0,0,255);
+    aspect_fix_fbo.end();
+    
+    dry_framebuffer.allocate(width,height);
+    dry_framebuffer.begin();
+    ofClear(0,0,0,255);
+    dry_framebuffer.end();
+    
+    sharpenFramebuffer.allocate(width,height);
+    sharpenFramebuffer.begin();
+    ofClear(0,0,0,255);
+    sharpenFramebuffer.end();
+
+    // Datamosh FBOs - ping-pong accumulator and previous frame
+    for(int i=0; i<2; i++){
+        moshAccum[i].allocate(width, height);
+        moshAccum[i].begin();
+        ofClear(0,0,0,255);
+        moshAccum[i].end();
+    }
+    moshPrevFrame.allocate(width, height);
+    moshPrevFrame.begin();
+    ofClear(0,0,0,255);
+    moshPrevFrame.end();
+
+    // Post-process FBOs for chroma/crush chain
+    for(int i=0; i<2; i++){
+        postFx[i].allocate(width, height);
+        postFx[i].begin();
+        ofClear(0,0,0,255);
+        postFx[i].end();
+    }
+
+    for(int i=0;i<framebufferLength;i++){
+        pastFrames[i].allocate(width, height);
+        pastFrames[i].begin();
+        ofClear(0,0,0,255);
+        pastFrames[i].end();
+    }
+}
+//-------------------------------------------------------------
+void ofApp::inputSetup(){
+    //pass in the settings and it will start the camera
+    if(inputswitch==0){
+        //videoGrabber.setup(settings);
+    }
+    if(inputswitch==1){
+        cam1.listDevices() ;
+        cam1.setDeviceID(10) ;
+        cam1.setDesiredFrameRate(30);
+        cam1.initGrabber(width,height);
+    }
+}
+//--------------------------------------------------------------
+void ofApp::keyPressed(int key) {
+    if (key == ')') {fft.setNormalize(true);}
+    
+    //error-if i decrement fb0_delayamount it always crashes...
+    if (key == '[') {fb0_delayamount += 1;}
+    if (key == ']') {
+        fb0_delayamount = fb0_delayamount-1;
+        if(fb0_delayamount<0){
+            fb0_delayamount=framebufferLength-fb0_delayamount;
+        }//endiffb0
+    }//endifkey
+    
+    //fb1 mix
+    if (key == 'o') {op += .01;}
+    if (key == 'p') {op -= .01;}
+    
+    //fb0 z displace
+    if (key == 'a') {az += .0001;}
+    if (key == 'z') {az -= .0001;}
+    
+    //fb0 x displace
+    if (key == 's') {sx += .0001;}
+    if (key == 'x') {sx -= .0001;}
+    
+    //fb0 y displace
+    if (key == 'd') {dc += .0001;}
+    if (key == 'c') {dc -= .0001;}
+    
+    //fb0 hue attenuate
+    if (key == 'f') {fv += .001;}
+    if (key == 'v') {fv -= .001;}
+    
+    //fb0 saturation attenuate
+    if (key == 'g') {gb += .001;}
+    if (key == 'b') {gb -= .001;}
+    
+    //fb0 brightness attenuate
+    if (key == 'h') {hn += .001;}
+    if (key == 'n') {hn -= .001;}
+    
+    //fb0 mix
+    if (key == 'j') {jm += .01;}
+    if (key == 'm') {jm -= .01;}
+    
+    //fb0 lumakey value
+    if (key == 'k') {kk = ofClamp(kk+.01,0.0,1.0);}
+    if (key == ',') {kk = ofClamp(kk-.01,0.0,1.0);}
+    
+    
+    if (key == 'l') {ll += .01;}
+    if (key == '.') {ll -= .01;}
+    
+    if (key == ';') {fb1_brightx += .01;}
+    if (key == '\'') {fb1_brightx -= .01;}
+    
+    //fb0 rotation
+    if (key == 'q') {qw += .0001;}
+    if (key == 'w') {qw -= .0001;}
+    
+    
+    //hue chaos1
+    if (key == 'e') {er += .001;}
+    if (key == 'r') {er -= .001;}
+    
+    //hue chaos2
+    if (key == 't') {ty += .01;}
+    if (key == 'y') {ty -= .01;}
+    
+    //hue chaos3
+    if (key == 'u') {ui += .01;}
+    if (key == 'i') {ui -= .01;}
+    
+    if (key == '1') {
+        //clear the framebuffer if thats whats up
+        framebuffer0.begin();
+        ofClear(0, 0, 0, 255);
+        framebuffer0.end();
+        for(int i=0;i<framebufferLength;i++){
+            pastFrames[i].begin();
+            ofClear(0,0,0,255);
+            pastFrames[i].end();
+            
+        }//endifor
+    }
+    
+    if(key=='2'){brightInvert=!brightInvert;}
+    if(key=='3'){hueInvert=!hueInvert;}
+    if(key=='4'){saturationInvert=!saturationInvert;}
+    
+    if(key=='5'){verticalMirror=!verticalMirror;}
+    if(key=='6'){horizontalMirror=!horizontalMirror;}
+    
+    if(key=='7'){toroidSwitch=!toroidSwitch;}
+    
+    if (key == '-') {y_skew += .01;}
+    if (key == '=') {y_skew -= .01;}
+    if (key == '9') {x_skew += .01;}
+    if (key == '0') {x_skew -= .01;}
+    
+    //reset button
+    if (key == '!') {
+        az = 1.0;
+        sx = 0;
+        dc = 0;
+        fv = 1;
+        gb = 1;
+        hn = 1;
+        jm = 0.0;
+        kk = 0.0;
+        ll = 0.0;
+        qw = 0.0;
+        
+        er = 1.0;
+        ty = 0.0;
+        ui = 0.0;
+        
+        op = 0.0;
+        fb0_delayamount=0;
+        
+        brightInvert=0;
+        hueInvert=0;
+        saturationInvert=0;
+        
+        verticalMirror=0;
+        horizontalMirror=0;
+        
+        x_skew=0;
+        y_skew=0;
+        
+        framebuffer0.begin();
+        ofClear(0, 0, 0, 255);
+        framebuffer0.end();
+        
+        for(int i=0;i<framebufferLength;i++){
+            pastFrames[i].begin();
+            ofClear(0,0,0,255);
+            pastFrames[i].end();
+        }//endifor
+    }
+}
+// =============================================================================
+// MIDI MESSAGE PROCESSING
+// =============================================================================
+// Processes incoming MIDI CC messages from automidi.
+// Handles:
+//   - Toggle switches (on/off states)
+//   - Continuous controls with pick-up behavior
+//   - P-lock recording
+//   - Audio-reactive assignment
+//   - Patch load/save commands
+void ofApp::midibiz(){
+
+    for(unsigned int i = 0; i < midiMessages.size(); ++i) {
+
+        ofxMidiMessage &message = midiMessages[i];
+        
+        if(message.status < MIDI_SYSEX) {
+            if(message.status == MIDI_CONTROL_CHANGE) {
+                
+                if(message.control==91){
+                    if(message.value==127){
+                        forceMidiWrite = true ;
+                        forceMidiWriteTimer = ofGetElapsedTimeMillis() ;
+                        midiLatchClear() ;
+                        for(int i=0;i<p_lock_number;i++){
+                            midiActiveFloat[i]=1 ;
+                        }
+                    }
+                    if(message.value==0){
+                        forceMidiWrite = false ;
+                        forceMidiWriteTimer = 0 ;
+                        fillPLockFromCurrent() ;
+                        midiLatchClear() ;
+                    }
+                }
+                if(message.control==92){
+                    saveAudioPatch((int)message.value) ;
+                    message.control = 0 ;  // Mark as processed to prevent re-processing
+                }
+                if(message.control==93){
+                    loadAudioPatch((int)message.value) ;
+                    message.control = 0 ;  // Mark as processed to prevent re-processing
+                }
+                // Safety timeout — auto-disable forceMidiWrite after 2s
+                if(forceMidiWrite && ofGetElapsedTimeMillis() - forceMidiWriteTimer > 2000){
+                    forceMidiWrite = false ;
+                    forceMidiWriteTimer = 0 ;
+                    fillPLockFromCurrent() ;
+                    midiLatchClear() ;
+                }
+                if(message.control==2){
+                    blackoutAmount = message.value / 127.0f ;
+                }
+                if(message.control==7){
+                    inputGain=ofMap(message.value,0,127,0.0f,4.0f);
+                }
+                if(message.control==39){
+                    if(message.value==127){
+                        videoReactiveSwitch=1;
+                    }
+                    if(message.value==0){
+                        videoReactiveSwitch=0;
+                    }
+                }
+                if(message.control==43){
+                    if(message.value==127){
+                        audioReactiveControlSwitch=1;
+                    }
+                    if(message.value==0){
+                        audioReactiveControlSwitch=0;
+                    }
+                }
+                if(message.control==44){
+                    if(message.value==127){
+                        audioReactiveControlSwitch=2;
+                    }
+                    if(message.value==0){
+                        audioReactiveControlSwitch=0;
+                    }
+                }
+                if(message.control==42){
+                    if(message.value==127){
+                        audioReactiveControlSwitch=3;
+                    }
+                    if(message.value==0){
+                        audioReactiveControlSwitch=0;
+                    }
+                }
+                if(message.control==55){
+                    if(message.value==127){
+                        p_lock_switch=1;
+                        for(int i=0;i<p_lock_number;i++){
+                            p_lock_smoothed[i]=0;
+                            for(int j=0;j<p_lock_size;j++){
+                                p_lock[i][j]=p_lock[i][p_lock_increment];
+                            }
+                        }
+                    }
+                    if(message.value==0){
+                        p_lock_switch=0;
+                    }
+                }
+                if(message.control==32){
+                    if(message.value==127){ x_2=TRUE; }
+                    if(message.value==0){ x_2=FALSE; }
+                }
+                if(message.control==48){
+                    if(message.value==127){ x_5=TRUE; }
+                    if(message.value==0){ x_5=FALSE; }
+                }
+                if(message.control==64){
+                    if(message.value==127){ x_10=TRUE; }
+                    if(message.value==0){ x_10=FALSE; }
+                }
+                if(message.control==33){
+                    if(message.value==127){ y_2=TRUE; }
+                    if(message.value==0){ y_2=FALSE; }
+                }
+                if(message.control==49){
+                    if(message.value==127){ y_5=TRUE; }
+                    if(message.value==0){ y_5=FALSE; }
+                }
+                if(message.control==65){
+                    if(message.value==127){ y_10=TRUE; }
+                    if(message.value==0){ y_10=FALSE; }
+                }
+                if(message.control==34){
+                    if(message.value==127){ z_2=TRUE; }
+                    if(message.value==0){ z_2=FALSE; }
+                }
+                if(message.control==50){
+                    if(message.value==127){ z_5=TRUE; }
+                    if(message.value==0){ z_5=FALSE; }
+                }
+                if(message.control==66){
+                    if(message.value==127){ z_10=TRUE; }
+                    if(message.value==0){ z_10=FALSE; }
+                }
+                if(message.control==35){
+                    if(message.value==127){ r_2=TRUE; }
+                    if(message.value==0){ r_2=FALSE; }
+                }
+                if(message.control==51){
+                    if(message.value==127){ r_5=TRUE; }
+                    if(message.value==0){ r_5=FALSE; }
+                }
+                if(message.control==67){
+                    if(message.value==127){ r_10=TRUE; }
+                    if(message.value==0){ r_10=FALSE; }
+                }
+                if(message.control==36){
+                    if(message.value==127){ huexx_0=TRUE; }
+                    if(message.value==0){ huexx_0=FALSE; }
+                }
+                if(message.control==52){
+                    if(message.value==127){ huexx_1=TRUE; }
+                    if(message.value==0){ huexx_1=FALSE; }
+                }
+                if(message.control==68){
+                    if(message.value==127){ huexx_2=TRUE; }
+                    if(message.value==0){ huexx_2=FALSE; }
+                }
+                if(message.control==46){
+                    if(message.value==127){ toroidSwitch=TRUE; }
+                    if(message.value==0){ toroidSwitch=FALSE; }
+                }
+                if(message.control==61){
+                    if(message.value==127){ mirrorSwitch=TRUE; }
+                    if(message.value==0){ mirrorSwitch=FALSE; }
+                }
+                if(y_skew_switch==TRUE){ y_skew+=.00001; }
+                if(x_skew_switch==TRUE){ x_skew+=.00001; }
+                if(message.control==71){
+                    if(message.value==127){ wet_dry_switch=FALSE; }
+                    if(message.value==0){ wet_dry_switch=TRUE; }
+                }
+                if(message.control==37){
+                    if(message.value==127){ huexy_0=TRUE; }
+                    if(message.value==0){ huexy_0=FALSE; }
+                }
+                if(message.control==53){
+                    if(message.value==127){ huexy_1=TRUE; }
+                    if(message.value==0){ huexy_1=FALSE; }
+                }
+                if(message.control==69){
+                    if(message.value==127){ huexy_2=TRUE; }
+                    if(message.value==0){ huexy_2=FALSE; }
+                }
+                if(message.control==38){
+                    if(message.value==127){ huexz_0=TRUE; }
+                    if(message.value==0){ huexz_0=FALSE; }
+                }
+                if(message.control==54){
+                    if(message.value==127){ huexz_1=TRUE; }
+                    if(message.value==0){ huexz_1=FALSE; }
+                }
+                if(message.control==70){
+                    if(message.value==127){ huexz_2=TRUE; }
+                    if(message.value==0){ huexz_2=FALSE; }
+                }
+                if(message.control==60){
+                    if(message.value==127){ lumakeyInvertSwitch=TRUE; }
+                    if(message.value==0){ lumakeyInvertSwitch=FALSE; }
+                }
+                // Datamosh control (CC 94 = encoder 7 page 2)
+                // Ignore during startup window (Force sends spurious CCs)
+                if(message.control==94 && (ofGetElapsedTimef() - startupTime) > STARTUP_IGNORE_SECS){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[16]=0;
+                        midiMidActiveFloat[16]=0;
+                        midiHighActiveFloat[16]=0;
+                        // Direct control - set base mosh value
+                        moshBase = message.value / 127.0f;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[16]=0;
+                        midiHighActiveFloat[16]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-lowC17)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[16]=1;
+                        }
+                        if(midiLowActiveFloat[16]==1){ lowC17=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[16]=0;
+                        midiHighActiveFloat[16]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-midC17)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[16]=1;
+                        }
+                        if(midiMidActiveFloat[16]==1){ midC17=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[16]=0;
+                        midiMidActiveFloat[16]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-highC17)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[16]=1;
+                        }
+                        if(midiHighActiveFloat[16]==1){ highC17=message.value/127.0f; }
+                    }
+                }
+                // Chromatic aberration control (CC 95)
+                if(message.control==95 && (ofGetElapsedTimef() - startupTime) > STARTUP_IGNORE_SECS){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[17]=0;
+                        midiMidActiveFloat[17]=0;
+                        midiHighActiveFloat[17]=0;
+                        chromaBase = message.value / 127.0f;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[17]=0;
+                        midiHighActiveFloat[17]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-lowC18)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[17]=1;
+                        }
+                        if(midiLowActiveFloat[17]==1){ lowC18=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[17]=0;
+                        midiHighActiveFloat[17]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-midC18)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[17]=1;
+                        }
+                        if(midiMidActiveFloat[17]==1){ midC18=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[17]=0;
+                        midiMidActiveFloat[17]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-highC18)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[17]=1;
+                        }
+                        if(midiHighActiveFloat[17]==1){ highC18=message.value/127.0f; }
+                    }
+                }
+                // Bit crush control (CC 96)
+                if(message.control==96 && (ofGetElapsedTimef() - startupTime) > STARTUP_IGNORE_SECS){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[18]=0;
+                        midiMidActiveFloat[18]=0;
+                        midiHighActiveFloat[18]=0;
+                        crushBase = message.value / 127.0f;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[18]=0;
+                        midiHighActiveFloat[18]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-lowC19)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[18]=1;
+                        }
+                        if(midiLowActiveFloat[18]==1){ lowC19=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[18]=0;
+                        midiHighActiveFloat[18]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-midC19)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[18]=1;
+                        }
+                        if(midiMidActiveFloat[18]==1){ midC19=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[18]=0;
+                        midiMidActiveFloat[18]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-highC19)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[18]=1;
+                        }
+                        if(midiHighActiveFloat[18]==1){ highC19=message.value/127.0f; }
+                    }
+                }
+                // Pixelize control (CC 97)
+                if(message.control==97 && (ofGetElapsedTimef() - startupTime) > STARTUP_IGNORE_SECS){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[19]=0;
+                        midiMidActiveFloat[19]=0;
+                        midiHighActiveFloat[19]=0;
+                        pixelBase = message.value / 127.0f;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[19]=0;
+                        midiHighActiveFloat[19]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-lowC20)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[19]=1;
+                        }
+                        if(midiLowActiveFloat[19]==1){ lowC20=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[19]=0;
+                        midiHighActiveFloat[19]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-midC20)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[19]=1;
+                        }
+                        if(midiMidActiveFloat[19]==1){ midC20=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[19]=0;
+                        midiMidActiveFloat[19]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-highC20)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[19]=1;
+                        }
+                        if(midiHighActiveFloat[19]==1){ highC20=message.value/127.0f; }
+                    }
+                }
+
+                // ============================================================
+                // CONTINUOUS CONTROLS
+                // ============================================================
+
+                // CC16 — lumakey (unipolar)
+                if(message.control==16){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[0]=0;
+                        midiMidActiveFloat[0]=0;
+                        midiHighActiveFloat[0]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[0]=0;
+                            if(forceMidiWrite || abs(message.value/127.0f-p_lock[0][p_lock_increment])<CONTROL_THRESHOLD){
+                                midiActiveFloat[0]=1;
+                            }
+                            if(midiActiveFloat[0]==1){
+                                p_lock[0][p_lock_increment]=message.value/127.0f;
+                            }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[0]=0;
+                            if(forceMidiWrite || abs(message.value/127.0f-vLumakeyValue)<CONTROL_THRESHOLD){
+                                vmidiActiveFloat[0]=1;
+                            }
+                            if(vmidiActiveFloat[0]==1){
+                                vLumakeyValue=message.value/127.0f;
+                            }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[0]=0;
+                        vmidiActiveFloat[0]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[0]=0;
+                        midiHighActiveFloat[0]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-lowC1)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[0]=1;
+                        }
+                        if(midiLowActiveFloat[0]==1){ lowC1=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[0]=0;
+                        midiHighActiveFloat[0]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-midC1)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[0]=1;
+                        }
+                        if(midiMidActiveFloat[0]==1){ midC1=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[0]=0;
+                        midiMidActiveFloat[0]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-highC1)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[0]=1;
+                        }
+                        if(midiHighActiveFloat[0]==1){ highC1=message.value/127.0f; }
+                    }
+                }
+
+                // CC17 — mix (bipolar)
+                if(message.control==17){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[1]=0;
+                        midiMidActiveFloat[1]=0;
+                        midiHighActiveFloat[1]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[1]=0;
+                            if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-p_lock[1][p_lock_increment])<CONTROL_THRESHOLD){
+                                midiActiveFloat[1]=1;
+                            }
+                            if(midiActiveFloat[1]==1){
+                                p_lock[1][p_lock_increment]=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[1]=0;
+                            if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-vMix)<CONTROL_THRESHOLD){
+                                vmidiActiveFloat[1]=1;
+                            }
+                            if(vmidiActiveFloat[1]==1){
+                                vMix=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[1]=0;
+                        vmidiActiveFloat[1]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[1]=0;
+                        midiHighActiveFloat[1]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC2)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[1]=1;
+                        }
+                        if(midiLowActiveFloat[1]==1){ lowC2=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[1]=0;
+                        midiHighActiveFloat[1]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC2)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[1]=1;
+                        }
+                        if(midiMidActiveFloat[1]==1){ midC2=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[1]=0;
+                        midiMidActiveFloat[1]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC2)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[1]=1;
+                        }
+                        if(midiHighActiveFloat[1]==1){ highC2=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                }
+
+                // CC18 — hue (bipolar)
+                if(message.control==18){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[2]=0;
+                        midiMidActiveFloat[2]=0;
+                        midiHighActiveFloat[2]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[2]=0;
+                            if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-p_lock[2][p_lock_increment])<CONTROL_THRESHOLD){
+                                midiActiveFloat[2]=1;
+                            }
+                            if(midiActiveFloat[2]==1){
+                                p_lock[2][p_lock_increment]=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[2]=0;
+                            if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-vHue)<CONTROL_THRESHOLD){
+                                vmidiActiveFloat[2]=1;
+                            }
+                            if(vmidiActiveFloat[2]==1){
+                                vHue=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[2]=0;
+                        vmidiActiveFloat[2]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[2]=0;
+                        midiHighActiveFloat[2]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC3)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[2]=1;
+                        }
+                        if(midiLowActiveFloat[2]==1){ lowC3=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[2]=0;
+                        midiHighActiveFloat[2]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC3)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[2]=1;
+                        }
+                        if(midiMidActiveFloat[2]==1){ midC3=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[2]=0;
+                        midiMidActiveFloat[2]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC3)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[2]=1;
+                        }
+                        if(midiHighActiveFloat[2]==1){ highC3=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                }
+
+                // CC19 — saturation (bipolar)
+                if(message.control==19){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[3]=0;
+                        midiMidActiveFloat[3]=0;
+                        midiHighActiveFloat[3]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[3]=0;
+                            if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-p_lock[3][p_lock_increment])<CONTROL_THRESHOLD){
+                                midiActiveFloat[3]=1;
+                            }
+                            if(midiActiveFloat[3]==1){
+                                p_lock[3][p_lock_increment]=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[3]=0;
+                            if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-vSaturation)<CONTROL_THRESHOLD){
+                                vmidiActiveFloat[3]=1;
+                            }
+                            if(vmidiActiveFloat[3]==1){
+                                vSaturation=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[3]=0;
+                        vmidiActiveFloat[3]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[3]=0;
+                        midiHighActiveFloat[3]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC4)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[3]=1;
+                        }
+                        if(midiLowActiveFloat[3]==1){ lowC4=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[3]=0;
+                        midiHighActiveFloat[3]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC4)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[3]=1;
+                        }
+                        if(midiMidActiveFloat[3]==1){ midC4=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[3]=0;
+                        midiMidActiveFloat[3]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC4)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[3]=1;
+                        }
+                        if(midiHighActiveFloat[3]==1){ highC4=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                }
+
+                // CC20 — brightness (bipolar)
+                if(message.control==20){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[4]=0;
+                        midiMidActiveFloat[4]=0;
+                        midiHighActiveFloat[4]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[4]=0;
+                            if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-p_lock[4][p_lock_increment])<CONTROL_THRESHOLD){
+                                midiActiveFloat[4]=1;
+                            }
+                            if(midiActiveFloat[4]==1){
+                                p_lock[4][p_lock_increment]=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[4]=0;
+                            if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-vBright)<CONTROL_THRESHOLD){
+                                vmidiActiveFloat[4]=1;
+                            }
+                            if(vmidiActiveFloat[4]==1){
+                                vBright=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[4]=0;
+                        vmidiActiveFloat[4]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[4]=0;
+                        midiHighActiveFloat[4]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC5)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[4]=1;
+                        }
+                        if(midiLowActiveFloat[4]==1){ lowC5=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[4]=0;
+                        midiHighActiveFloat[4]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC5)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[4]=1;
+                        }
+                        if(midiMidActiveFloat[4]==1){ midC5=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[4]=0;
+                        midiMidActiveFloat[4]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC5)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[4]=1;
+                        }
+                        if(midiHighActiveFloat[4]==1){ highC5=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                }
+
+                // CC21 — temporal filter mix (bipolar)
+                if(message.control==21){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[5]=0;
+                        midiMidActiveFloat[5]=0;
+                        midiHighActiveFloat[5]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[5]=0;
+                            if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-p_lock[5][p_lock_increment])<CONTROL_THRESHOLD){
+                                midiActiveFloat[5]=1;
+                            }
+                            if(midiActiveFloat[5]==1){
+                                p_lock[5][p_lock_increment]=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[5]=0;
+                            if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-vTemporalFilterMix)<CONTROL_THRESHOLD){
+                                vmidiActiveFloat[5]=1;
+                            }
+                            if(vmidiActiveFloat[5]==1){
+                                vTemporalFilterMix=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[5]=0;
+                        vmidiActiveFloat[5]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[5]=0;
+                        midiHighActiveFloat[5]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC6)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[5]=1;
+                        }
+                        if(midiLowActiveFloat[5]==1){ lowC6=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[5]=0;
+                        midiHighActiveFloat[5]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC6)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[5]=1;
+                        }
+                        if(midiMidActiveFloat[5]==1){ midC6=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[5]=0;
+                        midiMidActiveFloat[5]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC6)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[5]=1;
+                        }
+                        if(midiHighActiveFloat[5]==1){ highC6=(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                    }
+                }
+
+                // CC22 — temporal filter resonance (unipolar)
+                if(message.control==22){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[6]=0;
+                        midiMidActiveFloat[6]=0;
+                        midiHighActiveFloat[6]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[6]=0;
+                            if(forceMidiWrite || abs(message.value/127.0f-p_lock[6][p_lock_increment])<CONTROL_THRESHOLD){
+                                midiActiveFloat[6]=1;
+                            }
+                            if(midiActiveFloat[6]==1){
+                                p_lock[6][p_lock_increment]=message.value/127.0f;
+                            }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[6]=0;
+                            if(forceMidiWrite || abs(message.value/127.0f-vTemporalFilterResonance)<CONTROL_THRESHOLD){
+                                vmidiActiveFloat[6]=1;
+                            }
+                            if(vmidiActiveFloat[6]==1){
+                                vTemporalFilterResonance=message.value/127.0f;
+                            }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[6]=0;
+                        vmidiActiveFloat[6]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[6]=0;
+                        midiHighActiveFloat[6]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-lowC7)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[6]=1;
+                        }
+                        if(midiLowActiveFloat[6]==1){ lowC7=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[6]=0;
+                        midiHighActiveFloat[6]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-midC7)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[6]=1;
+                        }
+                        if(midiMidActiveFloat[6]==1){ midC7=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[6]=0;
+                        midiMidActiveFloat[6]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-highC7)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[6]=1;
+                        }
+                        if(midiHighActiveFloat[6]==1){ highC7=message.value/127.0f; }
+                    }
+                }
+
+                // CC23 — sharpen (unipolar)
+                if(message.control==23){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[7]=0;
+                        midiMidActiveFloat[7]=0;
+                        midiHighActiveFloat[7]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[7]=0;
+                            if(forceMidiWrite || abs(message.value/127.0f-p_lock[7][p_lock_increment])<CONTROL_THRESHOLD){
+                                midiActiveFloat[7]=1;
+                            }
+                            if(midiActiveFloat[7]==1){
+                                p_lock[7][p_lock_increment]=message.value/127.0f;
+                            }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[7]=0;
+                            if(forceMidiWrite || abs(message.value/127.0f-vSharpenAmount)<CONTROL_THRESHOLD){
+                                vmidiActiveFloat[7]=1;
+                            }
+                            if(vmidiActiveFloat[7]==1){
+                                vSharpenAmount=message.value/127.0f;
+                            }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[7]=0;
+                        vmidiActiveFloat[7]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[7]=0;
+                        midiHighActiveFloat[7]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-lowC8)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[7]=1;
+                        }
+                        if(midiLowActiveFloat[7]==1){ lowC8=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[7]=0;
+                        midiHighActiveFloat[7]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-midC8)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[7]=1;
+                        }
+                        if(midiMidActiveFloat[7]==1){ midC8=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[7]=0;
+                        midiMidActiveFloat[7]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-highC8)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[7]=1;
+                        }
+                        if(midiHighActiveFloat[7]==1){ highC8=message.value/127.0f; }
+                    }
+                }
+
+                // CC120 — x displace (bipolar)
+                if(message.control==120){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[8]=0;
+                        midiMidActiveFloat[8]=0;
+                        midiHighActiveFloat[8]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[8]=0;
+                            { float xRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float xMul=(x_2?2.0f:x_5?5.0f:x_10?10.0f:1.0f);
+                            if(forceMidiWrite || abs(xRaw*xMul-p_lock[8][p_lock_increment])<CONTROL_THRESHOLD*xMul){ midiActiveFloat[8]=1; }
+                            if(midiActiveFloat[8]==1){ p_lock[8][p_lock_increment]=xRaw*xMul; } }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[8]=0;
+                            { float xRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float xMul=(x_2?2.0f:x_5?5.0f:x_10?10.0f:1.0f);
+                            if(forceMidiWrite || abs(xRaw*xMul-vX)<CONTROL_THRESHOLD*xMul){ vmidiActiveFloat[8]=1; }
+                            if(vmidiActiveFloat[8]==1){ vX=xRaw*xMul; } }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[8]=0;
+                        vmidiActiveFloat[8]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[8]=0;
+                        midiHighActiveFloat[8]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC9)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[8]=1;
+                        }
+                        if(midiLowActiveFloat[8]==1){
+                            lowC9=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(x_2==TRUE){ lowC9=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_5==TRUE){ lowC9=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_10==TRUE){ lowC9=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[8]=0;
+                        midiHighActiveFloat[8]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC9)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[8]=1;
+                        }
+                        if(midiMidActiveFloat[8]==1){
+                            midC9=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(x_2==TRUE){ midC9=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_5==TRUE){ midC9=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_10==TRUE){ midC9=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[8]=0;
+                        midiMidActiveFloat[8]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC9)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[8]=1;
+                        }
+                        if(midiHighActiveFloat[8]==1){
+                            highC9=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(x_2==TRUE){ highC9=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_5==TRUE){ highC9=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(x_10==TRUE){ highC9=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                }
+
+                // CC121 — y displace (bipolar)
+                if(message.control==121){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[9]=0;
+                        midiMidActiveFloat[9]=0;
+                        midiHighActiveFloat[9]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[9]=0;
+                            { float yRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float yMul=(y_2?2.0f:y_5?5.0f:y_10?10.0f:1.0f);
+                            if(forceMidiWrite || abs(yRaw*yMul-p_lock[9][p_lock_increment])<CONTROL_THRESHOLD*yMul){ midiActiveFloat[9]=1; }
+                            if(midiActiveFloat[9]==1){ p_lock[9][p_lock_increment]=yRaw*yMul; } }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[9]=0;
+                            { float yRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float yMul=(y_2?2.0f:y_5?5.0f:y_10?10.0f:1.0f);
+                            if(forceMidiWrite || abs(yRaw*yMul-vY)<CONTROL_THRESHOLD*yMul){ vmidiActiveFloat[9]=1; }
+                            if(vmidiActiveFloat[9]==1){ vY=yRaw*yMul; } }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[9]=0;
+                        vmidiActiveFloat[9]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[9]=0;
+                        midiHighActiveFloat[9]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC10)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[9]=1;
+                        }
+                        if(midiLowActiveFloat[9]==1){
+                            lowC10=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(y_2==TRUE){ lowC10=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_5==TRUE){ lowC10=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_10==TRUE){ lowC10=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[9]=0;
+                        midiHighActiveFloat[9]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC10)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[9]=1;
+                        }
+                        if(midiMidActiveFloat[9]==1){
+                            midC10=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(y_2==TRUE){ midC10=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_5==TRUE){ midC10=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_10==TRUE){ midC10=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[9]=0;
+                        midiMidActiveFloat[9]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC10)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[9]=1;
+                        }
+                        if(midiHighActiveFloat[9]==1){
+                            highC10=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(y_2==TRUE){ highC10=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_5==TRUE){ highC10=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(y_10==TRUE){ highC10=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                }
+
+                // CC122 — z displace (bipolar)
+                if(message.control==122){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[10]=0;
+                        midiMidActiveFloat[10]=0;
+                        midiHighActiveFloat[10]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[10]=0;
+                            { float zRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float zMul=(z_2?2.0f:z_5?5.0f:z_10?10.0f:1.0f);
+                            if(forceMidiWrite || abs(zRaw*zMul-p_lock[10][p_lock_increment])<CONTROL_THRESHOLD*zMul){ midiActiveFloat[10]=1; }
+                            if(midiActiveFloat[10]==1){ p_lock[10][p_lock_increment]=zRaw*zMul; } }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[10]=0;
+                            { float zRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float zMul=(z_2?2.0f:z_5?5.0f:z_10?10.0f:1.0f);
+                            if(forceMidiWrite || abs(zRaw*zMul-vZ)<CONTROL_THRESHOLD*zMul){ vmidiActiveFloat[10]=1; }
+                            if(vmidiActiveFloat[10]==1){ vZ=zRaw*zMul; } }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[10]=0;
+                        vmidiActiveFloat[10]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[10]=0;
+                        midiHighActiveFloat[10]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC11)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[10]=1;
+                        }
+                        if(midiLowActiveFloat[10]==1){
+                            lowC11=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(z_2==TRUE){ lowC11=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_5==TRUE){ lowC11=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_10==TRUE){ lowC11=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[10]=0;
+                        midiHighActiveFloat[10]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC11)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[10]=1;
+                        }
+                        if(midiMidActiveFloat[10]==1){
+                            midC11=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(z_2==TRUE){ midC11=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_5==TRUE){ midC11=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_10==TRUE){ midC11=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[10]=0;
+                        midiMidActiveFloat[10]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC11)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[10]=1;
+                        }
+                        if(midiHighActiveFloat[10]==1){
+                            highC11=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(z_2==TRUE){ highC11=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_5==TRUE){ highC11=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(z_10==TRUE){ highC11=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                }
+
+                // CC123 — rotation (bipolar)
+                if(message.control==123){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[11]=0;
+                        midiMidActiveFloat[11]=0;
+                        midiHighActiveFloat[11]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[11]=0;
+                            { float rRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float rMul=(r_2?2.0f:r_5?5.0f:r_10?10.0f:1.0f);
+                            if(forceMidiWrite || abs(rRaw*rMul-p_lock[11][p_lock_increment])<CONTROL_THRESHOLD*rMul){ midiActiveFloat[11]=1; }
+                            if(midiActiveFloat[11]==1){ p_lock[11][p_lock_increment]=rRaw*rMul; } }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[11]=0;
+                            { float rRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float rMul=(r_2?2.0f:r_5?5.0f:r_10?10.0f:1.0f);
+                            if(forceMidiWrite || abs(rRaw*rMul-vRotate)<CONTROL_THRESHOLD*rMul){ vmidiActiveFloat[11]=1; }
+                            if(vmidiActiveFloat[11]==1){ vRotate=rRaw*rMul; } }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[11]=0;
+                        vmidiActiveFloat[11]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[11]=0;
+                        midiHighActiveFloat[11]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC12)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[11]=1;
+                        }
+                        if(midiLowActiveFloat[11]==1){
+                            lowC12=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(r_2==TRUE){ lowC12=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_5==TRUE){ lowC12=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_10==TRUE){ lowC12=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[11]=0;
+                        midiHighActiveFloat[11]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC12)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[11]=1;
+                        }
+                        if(midiMidActiveFloat[11]==1){
+                            midC12=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(r_2==TRUE){ midC12=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_5==TRUE){ midC12=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_10==TRUE){ midC12=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[11]=0;
+                        midiMidActiveFloat[11]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC12)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[11]=1;
+                        }
+                        if(midiHighActiveFloat[11]==1){
+                            highC12=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(r_2==TRUE){ highC12=2.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_5==TRUE){ highC12=5.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(r_10==TRUE){ highC12=10.0*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                }
+
+                // CC124 — hue modulo (unipolar)
+                if(message.control==124){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[12]=0;
+                        midiMidActiveFloat[12]=0;
+                        midiHighActiveFloat[12]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[12]=0;
+                            { float hxxDiv=(huexx_0?64.0f:huexx_1?96.0f:huexx_2?127.0f:32.0f); float hxxVal=message.value/hxxDiv;
+                            if(forceMidiWrite || abs(hxxVal-p_lock[12][p_lock_increment])<CONTROL_THRESHOLD*127.0f/hxxDiv){ midiActiveFloat[12]=1; }
+                            if(midiActiveFloat[12]==1){ p_lock[12][p_lock_increment]=hxxVal; } }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[12]=0;
+                            { float hxxDiv=(huexx_0?64.0f:huexx_1?96.0f:huexx_2?127.0f:32.0f); float hxxVal=message.value/hxxDiv;
+                            if(forceMidiWrite || abs(hxxVal-vHuexMod)<CONTROL_THRESHOLD*127.0f/hxxDiv){ vmidiActiveFloat[12]=1; }
+                            if(vmidiActiveFloat[12]==1){ vHuexMod=hxxVal; } }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[12]=0;
+                        vmidiActiveFloat[12]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[12]=0;
+                        midiHighActiveFloat[12]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-lowC13)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[12]=1;
+                        }
+                        if(midiLowActiveFloat[12]==1){
+                            lowC13=(message.value)/32.0f;
+                            if(huexx_0==TRUE){ lowC13=message.value/64.0f; }
+                            if(huexx_1==TRUE){ lowC13=message.value/96.0f; }
+                            if(huexx_2==TRUE){ lowC13=message.value/127.0f; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[12]=0;
+                        midiHighActiveFloat[12]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-midC13)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[12]=1;
+                        }
+                        if(midiMidActiveFloat[12]==1){
+                            midC13=(message.value)/32.0f;
+                            if(huexx_0==TRUE){ midC13=message.value/64.0f; }
+                            if(huexx_1==TRUE){ midC13=message.value/96.0f; }
+                            if(huexx_2==TRUE){ midC13=message.value/127.0f; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[12]=0;
+                        midiMidActiveFloat[12]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-highC13)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[12]=1;
+                        }
+                        if(midiHighActiveFloat[12]==1){
+                            highC13=(message.value)/32.0f;
+                            if(huexx_0==TRUE){ highC13=message.value/64.0f; }
+                            if(huexx_1==TRUE){ highC13=message.value/96.0f; }
+                            if(huexx_2==TRUE){ highC13=message.value/127.0f; }
+                        }
+                    }
+                }
+
+                // CC125 — hue offset (bipolar)
+                if(message.control==125){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[13]=0;
+                        midiMidActiveFloat[13]=0;
+                        midiHighActiveFloat[13]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[13]=0;
+                            { float hxyRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float hxyMul=(huexy_0?2.0f:huexy_1?4.0f:huexy_2?8.0f:1.0f);
+                            if(forceMidiWrite || abs(hxyRaw*hxyMul-p_lock[13][p_lock_increment])<CONTROL_THRESHOLD*hxyMul){ midiActiveFloat[13]=1; }
+                            if(midiActiveFloat[13]==1){ p_lock[13][p_lock_increment]=hxyRaw*hxyMul; } }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[13]=0;
+                            { float hxyRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float hxyMul=(huexy_0?2.0f:huexy_1?4.0f:huexy_2?8.0f:1.0f);
+                            if(forceMidiWrite || abs(hxyRaw*hxyMul-vHuexOff)<CONTROL_THRESHOLD*hxyMul){ vmidiActiveFloat[13]=1; }
+                            if(vmidiActiveFloat[13]==1){ vHuexOff=hxyRaw*hxyMul; } }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[13]=0;
+                        vmidiActiveFloat[13]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[13]=0;
+                        midiHighActiveFloat[13]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC14)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[13]=1;
+                        }
+                        if(midiLowActiveFloat[13]==1){
+                            lowC14=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(huexy_0==TRUE){ lowC14=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_1==TRUE){ lowC14=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_2==TRUE){ lowC14=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[13]=0;
+                        midiHighActiveFloat[13]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC14)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[13]=1;
+                        }
+                        if(midiMidActiveFloat[13]==1){
+                            midC14=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(huexy_0==TRUE){ midC14=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_1==TRUE){ midC14=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_2==TRUE){ midC14=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[13]=0;
+                        midiMidActiveFloat[13]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC14)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[13]=1;
+                        }
+                        if(midiHighActiveFloat[13]==1){
+                            highC14=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(huexy_0==TRUE){ highC14=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_1==TRUE){ highC14=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexy_2==TRUE){ highC14=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                }
+
+                // CC126 — hue lfo (bipolar)
+                if(message.control==126){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[14]=0;
+                        midiMidActiveFloat[14]=0;
+                        midiHighActiveFloat[14]=0;
+                        if(p_lock_0_switch==1){
+                            vmidiActiveFloat[14]=0;
+                            { float hxzRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float hxzMul=(huexz_0?2.0f:huexz_1?4.0f:huexz_2?8.0f:1.0f);
+                            if(forceMidiWrite || abs(hxzRaw*hxzMul-p_lock[14][p_lock_increment])<CONTROL_THRESHOLD*hxzMul){ midiActiveFloat[14]=1; }
+                            if(midiActiveFloat[14]==1){ p_lock[14][p_lock_increment]=hxzRaw*hxzMul; } }
+                        }
+                        if(videoReactiveSwitch==1){
+                            midiActiveFloat[14]=0;
+                            { float hxzRaw=(message.value-MIDI_MAGIC)/MIDI_MAGIC; float hxzMul=(huexz_0?2.0f:huexz_1?4.0f:huexz_2?8.0f:1.0f);
+                            if(forceMidiWrite || abs(hxzRaw*hxzMul-vHuexLfo)<CONTROL_THRESHOLD*hxzMul){ vmidiActiveFloat[14]=1; }
+                            if(vmidiActiveFloat[14]==1){ vHuexLfo=hxzRaw*hxzMul; } }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[14]=0;
+                        vmidiActiveFloat[14]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[14]=0;
+                        midiHighActiveFloat[14]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-lowC15)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[14]=1;
+                        }
+                        if(midiLowActiveFloat[14]==1){
+                            lowC15=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(huexz_0==TRUE){ lowC15=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_1==TRUE){ lowC15=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_2==TRUE){ lowC15=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[14]=0;
+                        midiHighActiveFloat[14]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-midC15)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[14]=1;
+                        }
+                        if(midiMidActiveFloat[14]==1){
+                            midC15=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(huexz_0==TRUE){ midC15=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_1==TRUE){ midC15=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_2==TRUE){ midC15=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[14]=0;
+                        midiMidActiveFloat[14]=0;
+                        if(forceMidiWrite || abs((message.value-MIDI_MAGIC)/MIDI_MAGIC-highC15)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[14]=1;
+                        }
+                        if(midiHighActiveFloat[14]==1){
+                            highC15=(message.value-MIDI_MAGIC)/MIDI_MAGIC;
+                            if(huexz_0==TRUE){ highC15=2.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_1==TRUE){ highC15=4.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                            if(huexz_2==TRUE){ highC15=8.0f*(message.value-MIDI_MAGIC)/MIDI_MAGIC; }
+                        }
+                    }
+                }
+
+                // CC127 — delay (unipolar, no video reactive)
+                if(message.control==127){
+                    if(audioReactiveControlSwitch==0){
+                        midiLowActiveFloat[15]=0;
+                        midiMidActiveFloat[15]=0;
+                        midiHighActiveFloat[15]=0;
+                        if(p_lock_0_switch==1){
+                            if(forceMidiWrite || abs(message.value/127.0f-p_lock[15][p_lock_increment])<CONTROL_THRESHOLD){
+                                midiActiveFloat[15]=1;
+                            }
+                            if(midiActiveFloat[15]==1){
+                                p_lock[15][p_lock_increment]=(message.value)/127.0;
+                            }
+                        }
+                    }
+                    if(audioReactiveControlSwitch!=0){
+                        midiActiveFloat[15]=0;
+                        vmidiActiveFloat[15]=0;
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        midiMidActiveFloat[15]=0;
+                        midiHighActiveFloat[15]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-lowC16)<CONTROL_THRESHOLD){
+                            midiLowActiveFloat[15]=1;
+                        }
+                        if(midiLowActiveFloat[15]==1){ lowC16=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==2){
+                        midiLowActiveFloat[15]=0;
+                        midiHighActiveFloat[15]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-midC16)<CONTROL_THRESHOLD){
+                            midiMidActiveFloat[15]=1;
+                        }
+                        if(midiMidActiveFloat[15]==1){ midC16=message.value/127.0f; }
+                    }
+                    if(audioReactiveControlSwitch==3){
+                        midiLowActiveFloat[15]=0;
+                        midiMidActiveFloat[15]=0;
+                        if(forceMidiWrite || abs(message.value/127.0f-highC16)<CONTROL_THRESHOLD){
+                            midiHighActiveFloat[15]=1;
+                        }
+                        if(midiHighActiveFloat[15]==1){ highC16=message.value/127.0f; }
+                    }
+                }
+
+                // ============================================================
+                // BOOLEAN CONTROLS
+                // ============================================================
+                if(message.control==60){
+                    if(message.value==127){ brightInvert=TRUE; }
+                    if(message.value==0){ brightInvert=FALSE; }
+                }
+                if(message.control==61){
+                    if(message.value==127){ saturationInvert=TRUE; }
+                    if(message.value==0){ saturationInvert=FALSE; }
+                }
+                if(message.control==62){
+                    if(message.value==127){ hueInvert=TRUE; }
+                    if(message.value==0){ hueInvert=FALSE; }
+                }
+                if(message.control==90){
+                    if(message.value==127){ hdmi_aspect_ratio_switch=TRUE; }
+                    if(message.value==0){ hdmi_aspect_ratio_switch=FALSE; }
+                }
+                if(message.control==41){
+                    if(message.value==127){ horizontalMirror=TRUE; }
+                    if(message.value==0){ horizontalMirror=FALSE; }
+                }
+                if(message.control==45){
+                    if(message.value==127){ verticalMirror=TRUE; }
+                    if(message.value==0){ verticalMirror=FALSE; }
+                }
+                if(message.control==59){
+                    if(message.value==127){
+                        vLumakeyValue=0.0; vMix=0.0; vHue=0.0; vSaturation=0.0;
+                        vBright=0.0; vTemporalFilterMix=0.0; vTemporalFilterResonance=0.0;
+                        vSharpenAmount=0.0; vX=0.0; vY=0.0; vZ=0.0; vRotate=0.0;
+                        vHuexMod=0.0; vHuexOff=0.0; vHuexLfo=0.0;
+                        lowC1=lowC2=lowC3=lowC4=lowC5=lowC6=lowC7=lowC8=lowC9=lowC10=lowC11=lowC12=lowC13=lowC14=lowC15=lowC16=0.0f;
+                        midC1=midC2=midC3=midC4=midC5=midC6=midC7=midC8=midC9=midC10=midC11=midC12=midC13=midC14=midC15=midC16=0.0f;
+                        highC1=highC2=highC3=highC4=highC5=highC6=highC7=highC8=highC9=highC10=highC11=highC12=highC13=highC14=highC15=highC16=0.0f;
+                        for(int i=0;i<p_lock_number;i++){
+                            midiActiveFloat[i]=0; vmidiActiveFloat[i]=0;
+                            midiLowActiveFloat[i]=0; midiMidActiveFloat[i]=0; midiHighActiveFloat[i]=0;
+                            for(int j=0;j<p_lock_size;j++){ p_lock[i][j]=0; }
+                        }
+                    }
+                }
+                if(message.control==58){
+                    if(message.value==127){
+                        if(clear_switch==0){
+                            clear_switch=1;
+                            framebuffer0.begin(); ofClear(0,0,0,255); framebuffer0.end();
+                            for(int i=0;i<framebufferLength;i++){
+                                pastFrames[i].begin(); ofClear(0,0,0,255); pastFrames[i].end();
+                            }
+                        }
+                    }
+                }
+                if(message.control!=58){ clear_switch=0; }
+            }
+        }
+    }
+}
+//-----------------------------------------------------------
+void ofApp::midibizOld(){
+    for(unsigned int i = 0; i < midiMessages.size(); ++i) {
+        
+        ofxMidiMessage &message = midiMessages[i];
+        
+        if(message.status < MIDI_SYSEX) {
+            //text << "chan: " << message.channel;
+            if(message.status == MIDI_CONTROL_CHANGE) {
+                
+ 
+               //How to Midi Map
+                //uncomment the line that says cout<<message control etc
+                //run the code and look down in the console
+                //when u move a knob on yr controller keep track of the number that shows up
+                //that is the cc value of the knob
+                //then go down to the part labled 'MIDIMAPZONE'
+                //and change the numbers for each if message.control== statement to the values
+                //on yr controller
+                
+                // cout << "message.control"<< message.control<< endl;
+                // cout << "message.value"<< message.value<< endl;
+                
+                
+                
+                //MIDIMAPZONE
+                //these are mostly all set to output bipolor controls at this moment (ranging from -1.0 to 1.0)
+                //if u uncomment the second line on each of these if statements that will switch thems to unipolor
+                //controls (ranging from 0.0to 1.0) if  you prefer
+                
+                if(message.control==39){
+                    if(message.value==127){
+                        p_lock_0_switch=0;
+                    }
+                    if(message.value==0){
+                        p_lock_0_switch=1;
+                    }
+                }
+                if(message.control==55){
+                    if(message.value==127){
+                        p_lock_switch=1;
+                    }
+                    if(message.value==0){
+                        p_lock_switch=0;
+                    }
+                }
+                if(message.control==58){
+                    if(message.value==127){
+                        for(int i=0;i<p_lock_number;i++){
+                            for(int j=0;j<p_lock_size;j++){
+                                p_lock[i][j]=0;
+                            }
+                        }
+                    }
+                }
+                if(message.control==32){
+                    if(message.value==127){
+                        x_2=TRUE;
+                    }
+                    if(message.value==0){
+                        x_2=FALSE;
+                    }
+                }
+                if(message.control==48){
+                    if(message.value==127){
+                        x_5=TRUE;
+                    }
+                    if(message.value==0){
+                        x_5=FALSE;
+                    }
+                }
+                if(message.control==64){
+                    if(message.value==127){
+                        x_10=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        x_10=FALSE;
+                    }
+                }
+                
+                
+                
+                if(message.control==33){
+                    if(message.value==127){
+                        y_2=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        y_2=FALSE;
+                    }
+                }
+                
+                if(message.control==49){
+                    if(message.value==127){
+                        y_5=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        y_5=FALSE;
+                    }
+                }
+                
+                if(message.control==65){
+                    if(message.value==127){
+                        y_10=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        y_10=FALSE;
+                    }
+                }
+                
+                
+                
+                if(message.control==34){
+                    if(message.value==127){
+                        z_2=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        z_2=FALSE;
+                    }
+                }
+                
+                if(message.control==50){
+                    if(message.value==127){
+                        z_5=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        z_5=FALSE;
+                    }
+                }
+                
+                if(message.control==66){
+                    if(message.value==127){
+                        z_10=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        z_10=FALSE;
+                    }
+                }
+                
+                
+                
+                
+                if(message.control==35){
+                    if(message.value==127){
+                        r_2=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        r_2=FALSE;
+                    }
+                }
+                
+                if(message.control==51){
+                    if(message.value==127){
+                        r_5=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        r_5=FALSE;
+                    }
+                }
+                
+                if(message.control==67){
+                    if(message.value==127){
+                        r_10=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        r_10=FALSE;
+                    }
+                }
+                
+                
+                
+                
+                if(message.control==36){
+                    if(message.value==127){
+                        huexx_0=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        huexx_0=FALSE;
+                    }
+                }
+                
+                if(message.control==52){
+                    if(message.value==127){
+                        huexx_1=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        huexx_1=FALSE;
+                    }
+                }
+                
+                if(message.control==68){
+                    if(message.value==127){
+                        huexx_2=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        huexx_2=FALSE;
+                    }
+                }
+                
+                if(message.control==46){
+                    if(message.value==127){
+                        toroidSwitch=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        toroidSwitch=FALSE;
+                    }
+                }
+                
+                
+                
+                
+                if(y_skew_switch==TRUE){
+                    y_skew+=.00001;
+                }
+                
+                if(x_skew_switch==TRUE){
+                    x_skew+=.00001;
+                }
+                
+                
+                if(message.control==71){
+                    if(message.value==127){
+                        wet_dry_switch=FALSE;
+                    }
+                    
+                    if(message.value==0){
+                        wet_dry_switch=TRUE;
+                    }
+                    
+                }
+                
+                //---------------------
+                
+                
+                
+                if(message.control==37){
+                    if(message.value==127){
+                        huexy_0=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        huexy_0=FALSE;
+                    }
+                }
+                
+                if(message.control==53){
+                    if(message.value==127){
+                        huexy_1=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        huexy_1=FALSE;
+                    }
+                }
+                
+                if(message.control==69){
+                    if(message.value==127){
+                        huexy_2=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        huexy_2=FALSE;
+                    }
+                }
+                
+                
+                //---------------------
+                
+                
+                
+                if(message.control==38){
+                    if(message.value==127){
+                        huexz_0=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        huexz_0=FALSE;
+                    }
+                }
+                
+                if(message.control==54){
+                    if(message.value==127){
+                        huexz_1=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        huexz_1=FALSE;
+                    }
+                }
+                
+                if(message.control==70){
+                    if(message.value==127){
+                        huexz_2=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        huexz_2=FALSE;
+                    }
+                }
+                if(message.control==43){
+                    if(message.value==127){
+                        audioReactiveControlSwitch=1;
+                    }
+                    
+                    if(message.value==0){
+                        audioReactiveControlSwitch=0;
+                    }
+                    
+                }
+                
+                if(message.control==44){
+                    if(message.value==127){
+                        audioReactiveControlSwitch=2;
+                    }
+                    
+                    if(message.value==0){
+                        audioReactiveControlSwitch=0;
+                    }
+                    
+                }
+                
+                if(message.control==42){
+                    if(message.value==127){
+                        audioReactiveControlSwitch=3;
+                    }
+                    
+                    if(message.value==0){
+                        audioReactiveControlSwitch=0;
+                    }
+                    
+                }
+                //nanokontrol2 controls
+                //c1 maps to fb0 lumakey
+                if(message.control==16){
+                    
+                    if(audioReactiveControlSwitch==0){
+                        if(p_lock_0_switch==1){
+                            p_lock[0][p_lock_increment]=message.value/127.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==1){
+                        lowC1=message.value/127.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC1=message.value/127.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC1=message.value/127.0f;
+                    }
+                }
+                
+                if(message.control==17){
+                    
+                    if(audioReactiveControlSwitch==0){
+                        if(p_lock_0_switch==1){
+                            p_lock[1][p_lock_increment]=(message.value-63)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==1){
+                        lowC2=(message.value-63.0f)/63.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC2=(message.value-63.0f)/63.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC2=(message.value-63.0f)/63.0f;
+                    }
+                }
+                
+                //c3 maps to fb0 huex
+                if(message.control==18){
+                    if(audioReactiveControlSwitch==0){
+                        if(p_lock_0_switch==1){
+                            p_lock[2][p_lock_increment]=(message.value-63)/63.0f;
+                        }
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        lowC3=(message.value-63.0f)/63.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC3=(message.value-63.0f)/63.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC3=(message.value-63.0f)/63.0f;
+                    }
+                    
+                }
+                
+                //c4 maps to fb0 satx
+                if(message.control==19){
+                    if(audioReactiveControlSwitch==0){
+                        if(p_lock_0_switch==1){
+                            p_lock[3][p_lock_increment]=(message.value-63)/63.0f;
+                        }
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        lowC4=(message.value-63.0f)/63.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC4=(message.value-63.0f)/63.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC4=(message.value-63.0f)/63.0f;
+                    }
+                }
+                
+                //c5 maps to fb0 brightx
+                if(message.control==20){
+                    if(audioReactiveControlSwitch==0){
+                        if(p_lock_0_switch==1){
+                            p_lock[4][p_lock_increment]=(message.value-63)/63.0f;
+                        }
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        lowC5=(message.value-63.0f)/63.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC5=(message.value-63.0f)/63.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC5=(message.value-63.0f)/63.0f;
+                    }
+                    
+                }
+                
+                //c6 maps to temporal filter
+                if(message.control==21){
+                    if(audioReactiveControlSwitch==0){
+                        if(p_lock_0_switch==1){
+                            p_lock[5][p_lock_increment]=(message.value-63)/63.0f;
+                        }
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        lowC6=(message.value-63.0f)/63.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC6=(message.value-63.0f)/63.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC6=(message.value-63.0f)/63.0f;
+                    }
+                }
+                
+                //c7 maps to temporal filter resonance
+                if(message.control==22){
+                    if(audioReactiveControlSwitch==0){
+                        if(p_lock_0_switch==1){
+                            p_lock[6][p_lock_increment]=(message.value)/127.0f;
+                        }
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        lowC7=(message.value)/127.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC7=(message.value)/127.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC7=(message.value)/127.0f;
+                    }
+                }
+                
+                //c8 maps to brightx
+                if(message.control==23){
+                    if(audioReactiveControlSwitch==0){
+                        if(p_lock_0_switch==1){
+                            p_lock[7][p_lock_increment]=(message.value)/127.0f;
+                        }
+                    }
+                    if(audioReactiveControlSwitch==1){
+                        lowC8=(message.value)/127.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC8=(message.value)/127.0f;
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC8=(message.value)/127.0f;
+                    }
+                    
+                }
+                
+                //c9 maps to fb0 x displace
+                if(message.control==120){
+                    if(audioReactiveControlSwitch==0){
+                        p_lock[8][p_lock_increment]=(message.value-63)/63.0f;
+                        
+                        if(x_2==TRUE){
+                            p_lock[8][p_lock_increment]=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(x_5==TRUE){
+                            p_lock[8][p_lock_increment]=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(x_10==TRUE){
+                            p_lock[8][p_lock_increment]=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==1){
+                        lowC9=(message.value-63)/63.0f;
+                        
+                        if(x_2==TRUE){
+                            lowC9=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(x_5==TRUE){
+                            lowC9=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(x_10==TRUE){
+                            lowC9=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC9=(message.value-63)/63.0f;
+                        
+                        if(x_2==TRUE){
+                            midC9=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(x_5==TRUE){
+                            midC9=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(x_10==TRUE){
+                            midC9=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC9=(message.value-63)/63.0f;
+                        
+                        if(x_2==TRUE){
+                            highC9=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(x_5==TRUE){
+                            highC9=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(x_10==TRUE){
+                            highC9=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                }
+                
+                //c10 maps to fb0 y displace
+                if(message.control==121){
+                    if(audioReactiveControlSwitch==0){
+                        p_lock[9][p_lock_increment]=(message.value-63)/63.0f;
+                        
+                        if(y_2==TRUE){
+                            p_lock[9][p_lock_increment]=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(y_5==TRUE){
+                            p_lock[9][p_lock_increment]=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(y_10==TRUE){
+                            p_lock[9][p_lock_increment]=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==1){
+                        lowC10=(message.value-63)/63.0f;
+                        
+                        if(y_2==TRUE){
+                            lowC10=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(y_5==TRUE){
+                            lowC10=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(y_10==TRUE){
+                            lowC10=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC10=(message.value-63)/63.0f;
+                        
+                        if(y_2==TRUE){
+                            midC10=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(y_5==TRUE){
+                            midC10=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(y_10==TRUE){
+                            midC10=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC10=(message.value-63)/63.0f;
+                        
+                        if(y_2==TRUE){
+                            highC10=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(y_5==TRUE){
+                            highC10=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(y_10==TRUE){
+                            highC10=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    
+                    
+                }
+                
+                
+                if(message.control==122){
+                    if(audioReactiveControlSwitch==0){
+                        p_lock[10][p_lock_increment]=(message.value-63.0)/63.0f;
+                        
+                        if(z_2==TRUE){
+                            p_lock[10][p_lock_increment]=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(z_5==TRUE){
+                            p_lock[10][p_lock_increment]=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(z_10==TRUE){
+                            p_lock[10][p_lock_increment]=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==1){
+                        lowC11=(message.value-63.0)/63.0f;
+                        
+                        if(z_2==TRUE){
+                            lowC11=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(z_5==TRUE){
+                            lowC11=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(z_10==TRUE){
+                            lowC11=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC11=(message.value-63.0)/63.0f;
+                        
+                        if(z_2==TRUE){
+                            midC11=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(z_5==TRUE){
+                            midC11=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(z_10==TRUE){
+                            midC11=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC11=(message.value-63.0)/63.0f;
+                        
+                        if(z_2==TRUE){
+                            highC11=2.0*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(z_5==TRUE){
+                            highC11=5.0*(message.value-63.0)/63.0f;
+                        }
+                        if(z_10==TRUE){
+                            highC11=10.0*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                }
+                
+                if(message.control==123){
+                    if(audioReactiveControlSwitch==0){
+                        p_lock[11][p_lock_increment]=(message.value-63)/63.0f;
+                        
+                        if(r_2==TRUE){
+                            p_lock[11][p_lock_increment]=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(r_5==TRUE){
+                            p_lock[11][p_lock_increment]=4*(message.value-63.0)/63.0f;
+                        }
+                        if(r_10==TRUE){
+                            p_lock[11][p_lock_increment]=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==1){
+                        lowC12=(message.value-63)/63.0f;
+                        
+                        if(r_2==TRUE){
+                            lowC12=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(r_5==TRUE){
+                            lowC12=4*(message.value-63.0)/63.0f;
+                        }
+                        if(r_10==TRUE){
+                            lowC12=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC12=(message.value-63)/63.0f;
+                        
+                        if(r_2==TRUE){
+                            midC12=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(r_5==TRUE){
+                            midC12=4*(message.value-63.0)/63.0f;
+                        }
+                        if(r_10==TRUE){
+                            midC12=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC12=(message.value-63)/63.0f;
+                        
+                        if(r_2==TRUE){
+                            highC12=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(r_5==TRUE){
+                            highC12=4*(message.value-63.0)/63.0f;
+                        }
+                        if(r_10==TRUE){
+                            highC12=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    
+                }
+                
+                
+                if(message.control==124){
+                    if(audioReactiveControlSwitch==0){
+                        p_lock[12][p_lock_increment]=(message.value)/32.0f;
+                        
+                        if(huexx_0==TRUE){
+                            p_lock[12][p_lock_increment]=message.value/64.0f;
+                        }
+                        
+                        if(huexx_1==TRUE){
+                            p_lock[12][p_lock_increment]=message.value/96.0f;
+                        }
+                        if(huexx_2==TRUE){
+                            p_lock[12][p_lock_increment]=message.value/127.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==1){
+                        lowC13=(message.value)/32.0f;
+                        
+                        if(huexx_0==TRUE){
+                            lowC13=message.value/64.0f;
+                        }
+                        
+                        if(huexx_1==TRUE){
+                            lowC13=message.value/96.0f;
+                        }
+                        if(huexx_2==TRUE){
+                            lowC13=message.value/127.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC13=(message.value)/32.0f;
+                        
+                        if(huexx_0==TRUE){
+                            midC13=message.value/64.0f;
+                        }
+                        
+                        if(huexx_1==TRUE){
+                            midC13=message.value/96.0f;
+                        }
+                        if(huexx_2==TRUE){
+                            midC13=message.value/127.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC13=(message.value)/32.0f;
+                        
+                        if(huexx_0==TRUE){
+                            highC13=message.value/64.0f;
+                        }
+                        
+                        if(huexx_1==TRUE){
+                            highC13=message.value/96.0f;
+                        }
+                        if(huexx_2==TRUE){
+                            highC13=message.value/127.0f;
+                        }
+                    }
+                }
+                
+                
+                if(message.control==125){
+                    if(audioReactiveControlSwitch==0){
+                        p_lock[13][p_lock_increment]=(message.value-63.0)/63.0f;
+                        
+                        if(huexy_0==TRUE){
+                            p_lock[13][p_lock_increment]=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(huexy_1==TRUE){
+                            p_lock[13][p_lock_increment]=4*(message.value-63.0)/63.0f;
+                        }
+                        if(huexy_2==TRUE){
+                            p_lock[13][p_lock_increment]=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==1){
+                        lowC14=(message.value-63.0)/63.0f;
+                        
+                        if(huexy_0==TRUE){
+                            lowC14=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(huexy_1==TRUE){
+                            lowC14=4*(message.value-63.0)/63.0f;
+                        }
+                        if(huexy_2==TRUE){
+                            lowC14=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC14=(message.value-63.0)/63.0f;
+                        
+                        if(huexy_0==TRUE){
+                            midC14=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(huexy_1==TRUE){
+                            midC14=4*(message.value-63.0)/63.0f;
+                        }
+                        if(huexy_2==TRUE){
+                            midC14=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC14=(message.value-63.0)/63.0f;
+                        
+                        if(huexy_0==TRUE){
+                            highC14=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(huexy_1==TRUE){
+                            highC14=4*(message.value-63.0)/63.0f;
+                        }
+                        if(huexy_2==TRUE){
+                            highC14=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    
+                    
+                    
+                }
+                
+                
+                if(message.control==126){
+                    if(audioReactiveControlSwitch==0){
+                        p_lock[14][p_lock_increment]=(message.value-63.0)/63.0f;
+                        
+                        if(huexz_0==TRUE){
+                            p_lock[14][p_lock_increment]=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(huexz_1==TRUE){
+                            p_lock[14][p_lock_increment]=4*(message.value-63.0)/63.0f;
+                        }
+                        if(huexz_2==TRUE){
+                            p_lock[14][p_lock_increment]=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==1){
+                        lowC15=(message.value-63.0)/63.0f;
+                        
+                        if(huexz_0==TRUE){
+                            lowC15=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(huexz_1==TRUE){
+                            lowC15=4*(message.value-63.0)/63.0f;
+                        }
+                        if(huexz_2==TRUE){
+                            lowC15=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC15=(message.value-63.0)/63.0f;
+                        
+                        if(huexz_0==TRUE){
+                            midC15=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(huexz_1==TRUE){
+                            midC15=4*(message.value-63.0)/63.0f;
+                        }
+                        if(huexz_2==TRUE){
+                            midC15=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC15=(message.value-63.0)/63.0f;
+                        
+                        if(huexz_0==TRUE){
+                            highC15=2*(message.value-63.0)/63.0f;
+                        }
+                        
+                        if(huexz_1==TRUE){
+                            highC15=4*(message.value-63.0)/63.0f;
+                        }
+                        if(huexz_2==TRUE){
+                            highC15=8*(message.value-63.0)/63.0f;
+                        }
+                    }
+                    
+                    
+                }
+                
+                
+                if(message.control==127){
+                    if(audioReactiveControlSwitch==0){
+                        p_lock[15][p_lock_increment]=(message.value)/127.0;
+                    }
+                    
+                    if(audioReactiveControlSwitch==1){
+                        lowC16=(message.value)/127.0;
+                    }
+                    
+                    if(audioReactiveControlSwitch==2){
+                        midC16=(message.value)/127.0;
+                    }
+                    
+                    if(audioReactiveControlSwitch==3){
+                        highC16=(message.value)/127.0;
+                    }
+                }
+                
+                
+                
+                
+                //gots to remap these to 60-61
+                //cc43 maps to brightInvert
+                if(message.control==60){
+                    if(message.value==127){
+                        brightInvert=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        brightInvert=FALSE;
+                    }
+                }
+                
+                //cc44 maps to saturationInvert
+                if(message.control==61){
+                    if(message.value==127){
+                        saturationInvert=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        saturationInvert=FALSE;
+                    }
+                }
+                
+                if(message.control==62){
+                    if(message.value==127){
+                        //hueInvert=TRUE;
+                        hdmi_aspect_ratio_switch=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        //hueInvert=FALSE;
+                        hdmi_aspect_ratio_switch=FALSE;
+                    }
+                }
+                
+                
+                //cc41 maps to horizontalMirror
+                if(message.control==41){
+                    if(message.value==127){
+                        horizontalMirror=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        horizontalMirror=FALSE;
+                    }
+                }
+                //cc45 maps to horizontalMirror
+                if(message.control==45){
+                    if(message.value==127){
+                        verticalMirror=TRUE;
+                    }
+                    
+                    if(message.value==0){
+                        verticalMirror=FALSE;
+                    }
+                }
+                if(message.control==59){
+                    
+                    x_skew=y_skew=0.0;
+                    lowC1=lowC2=lowC3=lowC4=lowC5=lowC6=lowC7=lowC8=lowC9=lowC10=lowC11=lowC12=lowC13=lowC14=lowC15=lowC16=0.0f;
+                    midC1=midC2=midC3=midC4=midC5=midC6=midC7=midC8=midC9=midC10=midC11=midC12=midC13=midC14=midC15=midC16=0.0f;
+                    highC1=highC2=highC3=highC4=highC5=highC6=highC7=highC8=highC9=highC10=highC11=highC12=highC13=highC14=highC15=highC16=0.0f;
+                }
+            }
+        }
+    }
+}
+
+//--------------------------------------------------------------
+void ofApp::keyReleased(int key) {
+}

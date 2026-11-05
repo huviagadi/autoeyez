@@ -1,0 +1,9 @@
+[Unit]
+Description=Start Autoeyez SIDE-KEYBOARD controller after boot settles
+
+[Timer]
+OnBootSec=10s
+Unit=side-keypad.service
+
+[Install]
+WantedBy=timers.target

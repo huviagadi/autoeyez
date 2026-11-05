@@ -1,0 +1,177 @@
+// shader_mixer fragment shader
+// Main video feedback and color processing for AUTO_WAAAVE
+precision highp float;
+
+uniform sampler2D tex0;           // Current input frame
+uniform sampler2D fb;             // Feedback buffer
+uniform sampler2D temporalFilter; // Temporal filter buffer
+
+// Continuous controls
+uniform float lumakey;
+uniform float fbMix;
+uniform float fbHue;
+uniform float fbSaturation;
+uniform float fbBright;
+uniform float temporalFilterMix;
+uniform float temporalFilterResonance;
+uniform float fbXDisplace;
+uniform float fbYDisplace;
+uniform float fbZDisplace;
+uniform float fbRotate;
+uniform float fbHuexMod;
+uniform float fbHuexOff;
+uniform float fbHuexLfo;
+
+// Switches
+uniform int toroidSwitch;
+uniform int mirrorSwitch;
+uniform int brightInvert;
+uniform int hueInvert;
+uniform int saturationInvert;
+uniform int horizontalMirror;
+uniform int verticalMirror;
+uniform int lumakeyInvertSwitch;
+
+// Video reactive controls
+uniform float vLumakey;
+uniform float vMix;
+uniform float vHue;
+uniform float vSat;
+uniform float vBright;
+uniform float vtemporalFilterMix;
+uniform float vFb1X;
+uniform float vX;
+uniform float vY;
+uniform float vZ;
+uniform float vRotate;
+uniform float vHuexMod;
+uniform float vHuexOff;
+uniform float vHuexLfo;
+
+varying vec2 texCoordVarying;
+
+// RGB to HSB conversion
+vec3 rgb2hsb(vec3 c) {
+    vec4 K = vec4(0.0, -1.0/3.0, 2.0/3.0, -1.0);
+    vec4 p = mix(vec4(c.bg, K.wz), vec4(c.gb, K.xy), step(c.b, c.g));
+    vec4 q = mix(vec4(p.xyw, c.r), vec4(c.r, p.yzx), step(p.x, c.r));
+    float d = q.x - min(q.w, q.y);
+    float e = 1.0e-10;
+    return vec3(abs(q.z + (q.w - q.y) / (6.0 * d + e)), d / (q.x + e), q.x);
+}
+
+// HSB to RGB conversion
+vec3 hsb2rgb(vec3 c) {
+    vec3 rgb = clamp(abs(mod(c.x * 6.0 + vec3(0.0, 4.0, 2.0), 6.0) - 3.0) - 1.0, 0.0, 1.0);
+    rgb = rgb * rgb * (3.0 - 2.0 * rgb);
+    return c.z * mix(vec3(1.0), rgb, c.y);
+}
+
+float luma(vec3 c) {
+    return dot(c, vec3(0.299, 0.587, 0.114));
+}
+
+void main()
+{
+    vec2 uv = texCoordVarying;
+
+    // Apply mirrors
+    if (horizontalMirror == 1) {
+        uv.x = 1.0 - uv.x;
+    }
+    if (verticalMirror == 1) {
+        uv.y = 1.0 - uv.y;
+    }
+
+    // Apply displacement
+    float totalX = fbXDisplace + vX;
+    float totalY = fbYDisplace + vY;
+    float totalZ = fbZDisplace + vZ;
+    float totalRotate = fbRotate + vRotate;
+
+    // Apply rotation around center
+    vec2 center = vec2(0.5, 0.5);
+    vec2 rotUV = uv - center;
+    float cosR = cos(totalRotate);
+    float sinR = sin(totalRotate);
+    rotUV = vec2(rotUV.x * cosR - rotUV.y * sinR,
+                 rotUV.x * sinR + rotUV.y * cosR);
+
+    // Apply zoom (Z displacement)
+    rotUV = rotUV * (1.0 - totalZ * 0.5);
+
+    // Apply X/Y displacement
+    rotUV = rotUV + center + vec2(totalX, totalY);
+
+    // Toroid wrapping or mirror at edges
+    if (toroidSwitch == 1) {
+        rotUV = fract(rotUV);
+    } else if (mirrorSwitch == 1) {
+        rotUV = abs(mod(rotUV, 2.0) - 1.0);
+        rotUV = 1.0 - rotUV;
+    }
+
+    // Clamp UV
+    rotUV = clamp(rotUV, 0.0, 1.0);
+
+    // Sample textures
+    vec4 currentFrame = texture2D(tex0, uv);
+    vec4 feedbackFrame = texture2D(fb, rotUV);
+    vec4 temporalFrame = texture2D(temporalFilter, rotUV);
+
+    // Apply temporal filter mixing
+    float totalTempMix = temporalFilterMix + vtemporalFilterMix;
+    vec4 mixedFeedback = mix(feedbackFrame, temporalFrame, clamp(totalTempMix, 0.0, 1.0));
+
+    // Apply temporal filter resonance (brightness boost)
+    mixedFeedback.rgb *= (1.0 + temporalFilterResonance * vFb1X);
+
+    // Lumakey mixing
+    float totalLumakey = lumakey + vLumakey;
+    float feedbackLuma = luma(mixedFeedback.rgb);
+    float lumakeyMask;
+    if (lumakeyInvertSwitch == 1) {
+        lumakeyMask = step(feedbackLuma, totalLumakey);
+    } else {
+        lumakeyMask = step(totalLumakey, feedbackLuma);
+    }
+
+    // Mix feedback with current frame
+    float totalMix = fbMix + vMix;
+    vec4 mixed = mix(currentFrame, mixedFeedback, clamp(totalMix, 0.0, 1.0) * lumakeyMask);
+
+    // Convert to HSB for color manipulation
+    vec3 hsb = rgb2hsb(mixed.rgb);
+
+    // Apply hue shift
+    float totalHue = fbHue + vHue;
+    float huexMod = fbHuexMod * (1.0 - vHuexMod);
+    float huexOff = fbHuexOff + vHuexOff;
+    float huexLfo = fbHuexLfo + vHuexLfo;
+
+    hsb.x = mod(hsb.x + totalHue + huexOff + hsb.x * huexMod * huexLfo, 1.0);
+
+    // Apply saturation
+    float totalSat = fbSaturation + vSat;
+    hsb.y = clamp(hsb.y * (1.0 + totalSat), 0.0, 1.0);
+
+    // Apply brightness
+    float totalBright = fbBright + vBright;
+    hsb.z = clamp(hsb.z * (1.0 + totalBright), 0.0, 1.0);
+
+    // Apply inversions
+    if (hueInvert == 1) {
+        hsb.x = 1.0 - hsb.x;
+    }
+    if (saturationInvert == 1) {
+        hsb.y = 1.0 - hsb.y;
+    }
+    if (brightInvert == 1) {
+        hsb.z = 1.0 - hsb.z;
+    }
+
+    // Convert back to RGB
+    vec3 result = hsb2rgb(hsb);
+
+    gl_FragColor = vec4(result, 1.0);
+}

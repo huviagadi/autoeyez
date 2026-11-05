@@ -1,0 +1,13 @@
+[Unit]
+Description=Raw UDP Video Receiver
+After=network.target
+
+[Service]
+ExecStartPre=/bin/sleep 3
+ExecStart=/usr/bin/python3 /home/admin/udp_receive.py
+Restart=always
+RestartSec=5
+User=pi
+
+[Install]
+WantedBy=multi-user.target

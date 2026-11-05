@@ -46,8 +46,17 @@ public:
 
 	ofShader shader_mixer;
 	ofShader shaderSharpen;
+	ofShader shaderPixel;
+	ofShader shaderChroma;
+	ofShader shaderCrush;
+	ofShader shaderMosh;
 
 	void fbDeclareAndAllocate();
+
+	// Mosh effect FBOs (ping-pong accumulator)
+	ofFbo moshAccum[2];
+	ofFbo moshPrevFrame;
+	int moshAccumIndex = 0;
     ofFbo framebuffer0;
     ofFbo framebuffer1;
     ofFbo sharpenFramebuffer;
@@ -55,6 +64,15 @@ public:
     void inputSetup();
     void inputUpdate();
     ofVideoGrabber cam1;
+
+    // Loading state (shows "LOADING..." until video ready)
+    bool videoInitialized = false;
+    bool videoReady = false;
+    unsigned long lastFrameTime = 0;
+    int loadingDotState = 0;
+    unsigned long lastDotUpdate = 0;
+    bool checkSocketExists();
+    void drawLoading();
     
     void p_lockClear();
     void p_lockUpdate();

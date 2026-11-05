@@ -1,0 +1,31 @@
+# Pi 5 config.txt for autowaaave
+# Location: /boot/firmware/config.txt (note: different from Pi 3!)
+
+# Camera/video support
+camera_auto_detect=1
+display_auto_detect=1
+
+# HiFiBerry DAC+ ADC
+dtoverlay=hifiberry-dacplusadc
+
+# Disable onboard audio (conflicts with HiFiBerry)
+dtparam=audio=off
+
+# GPU memory
+gpu_mem=256
+
+# I2C (for any future expansion)
+dtparam=i2c_arm=on
+
+# Disable splash for faster boot
+disable_splash=1
+
+# HDMI settings (Pi 5 uses KMS, these may need adjustment)
+# hdmi_force_hotplug=1
+
+# For 720p output (if needed):
+# framebuffer_width=1280
+# framebuffer_height=720
+
+# VC4 KMS driver (usually default on Pi 5)
+# dtoverlay=vc4-kms-v3d
