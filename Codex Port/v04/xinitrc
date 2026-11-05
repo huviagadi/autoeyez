@@ -1,0 +1,8 @@
+#!/bin/sh
+# Clone the unscaled 1080p program framebuffer. The internal panel scales it
+# itself; avoid costly Pi-side scaling.
+xrandr --output HDMI-1 --mode 1920x1080 --rate 60 --primary 2>/dev/null
+xrandr --output HDMI-2 --mode 1920x1080 --rate 60 --same-as HDMI-1 --scale 1x1 2>/dev/null
+
+# Run the app passed as argument
+exec "$@"

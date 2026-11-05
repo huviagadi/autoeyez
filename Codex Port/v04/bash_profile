@@ -1,0 +1,5 @@
+# Auto-start the Pi 5 v04 integration build on tty1.
+if [ "$(tty)" = "/dev/tty1" ]; then
+    export SHMSRC_PATH=/tmp/video_shm
+    exec startx ~/start_pi_5_stable_04.sh -- :0 vt1 -nolisten tcp 2>&1 | tee /tmp/pi_5_stable_04.log
+fi

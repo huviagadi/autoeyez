@@ -1,0 +1,18 @@
+[Unit]
+Description=AUTO_WAAAVE_4_5
+After=stream_receive_shm.service
+Requires=stream_receive_shm.service
+
+[Service]
+Type=simple
+User=pi
+WorkingDirectory=/home/pi/openFrameworks/apps/myApps/AUTO_WAAAVE_4_5
+Environment=SHMSRC_PATH=/tmp/video_shm
+ExecStartPre=/bin/bash -c 'until [ -S /tmp/video_shm ]; do sleep 0.5; done'
+ExecStart=/home/pi/openFrameworks/apps/myApps/AUTO_WAAAVE_4_5/bin/AUTO_WAAAVE_4_5
+Restart=always
+RestartSec=2
+StartLimitIntervalSec=0
+
+[Install]
+WantedBy=multi-user.target

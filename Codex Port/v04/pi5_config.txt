@@ -1,0 +1,61 @@
+# For more options and information see
+# http://rptl.io/configtxt
+# Some settings may impact device functionality. See link above for details
+
+# Uncomment some or all of these to enable the optional hardware interfaces
+#dtparam=i2c_arm=on
+#dtparam=i2s=on
+#dtparam=spi=on
+
+# The physical HiFiBerry DAC+ ADC provides the live line input for FFT.
+# Disable the conflicting onboard PWM audio and instantiate the I2S codec.
+dtparam=audio=off
+dtoverlay=hifiberry-dacplusadc
+
+# Additional overlays and parameters are documented
+# /boot/firmware/overlays/README
+
+# Automatically load overlays for detected cameras
+camera_auto_detect=1
+
+# Automatically load overlays for detected DSI displays
+display_auto_detect=1
+
+# Automatically load initramfs files, if found
+auto_initramfs=1
+
+# Enable DRM VC4 V3D driver
+# Reserve contiguous memory for the 1080p feedback FBO ring (30 RGBA frames)
+# and associated compositor buffers on the Pi 5.
+dtoverlay=vc4-kms-v3d,cma-512
+max_framebuffers=2
+
+# Don't have the firmware create an initial video= setting in cmdline.txt.
+# Use the kernel's default instead.
+disable_fw_kms_setup=1
+
+# Run in 64-bit mode
+arm_64bit=1
+
+# Disable compensation for displays with overscan
+disable_overscan=1
+
+# Run as fast as firmware / board allows
+arm_boost=1
+
+# Conservative Pi 5 graphics-only overclock for the 1080p dual-HDMI render
+# pipeline. Keep the CPU, core, and memory domains at their firmware-managed
+# values; V3D is the GPU domain used by the OpenGL shader workload.
+v3d_freq=1050
+
+[cm4]
+# Enable host mode on the 2711 built-in XHCI USB controller.
+# This line should be removed if the legacy DWC2 controller is required
+# (e.g. for USB device mode) or if USB support is not required.
+otg_mode=1
+
+[cm5]
+dtoverlay=dwc2,dr_mode=host
+
+[all]
+disable_splash=1
